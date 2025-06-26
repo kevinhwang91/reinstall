@@ -2403,7 +2403,7 @@ create_part() {
     info "Create Part"
 
     # 分区工具
-    apk add parted e2fsprogs
+    apk add parted e2fsprogs btrfs-progs
     if is_efi; then
         apk add dosfstools
     fi
@@ -2606,14 +2606,18 @@ create_part() {
             echo                                #1 bios_boot
             mkfs.ext4 -F $ext4_opts /dev/$xda*2 #2 os
         else
-            # bios
             parted /dev/$xda -s -- \
                 mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
+                mkpart primary btrfs 1MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+            mkfs.btrfs -f -L os /dev/$xda*1
+            mount /dev/$xda*1 /mnt
+
+            # 3. 在顶层卷中创建子卷
+            btrfs subvolume create /mnt/@
+            umount /mnt
         fi
     else
         # 安装红帽系或ubuntu
@@ -5267,7 +5271,7 @@ mount_part_basic_layout() {
 
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 /dev/${xda}*${os_part_num} $os_dir
+    mount -t btrfs -o noatime,compress=zstd,subvol=@ /dev/${xda}*${os_part_num} $os_dir
 
     # 挂载 efi 分区
     if is_efi; then

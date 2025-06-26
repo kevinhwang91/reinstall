@@ -1986,6 +1986,8 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 EOF
         mkdir -p /etc/pacman.d
+        mkdir -p $os_dir/var/lib/portables $os_dir/var/lib/machines
+
         # shellcheck disable=SC2016
         case "$(uname -m)" in
         x86_64) dir='$repo/os/$arch' ;;
@@ -2251,7 +2253,21 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if grep -q '^[#[:space:]]*GRUB_TIMEOUT=' "$file"; then
+        sed -i 's/^[#[:space:]]*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' $file
+    else
+        echo 'GRUB_TIMEOUT=1' >>$file
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
+
+    if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
+        mkdir -p "$os_dir/.snapshots"
+        btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+        mount -t btrfs -o noatime,compress=zstd,subvol=@snapshots "$btrfs_part" "$os_dir/.snapshots"
+        mkdir -p "$os_dir/swap"
+        mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
+    fi
 
     # fstab
     # fstab 可不写 efi 条目， systemd automount 会自动挂载
@@ -2445,7 +2461,7 @@ create_part() {
     info "Create Part"
 
     # 分区工具
-    apk add parted e2fsprogs
+    apk add parted e2fsprogs btrfs-progs
     if is_efi; then
         apk add dosfstools
     fi
@@ -2648,14 +2664,20 @@ create_part() {
             echo                                #1 bios_boot
             mkfs.ext4 -F $ext4_opts /dev/$xda*2 #2 os
         else
-            # bios
             parted /dev/$xda -s -- \
                 mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
+                mkpart primary btrfs 1MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+            mkfs.btrfs -f -L os /dev/$xda*1
+            mount /dev/$xda*1 /mnt
+
+            # 3. 在顶层卷中创建子卷
+            btrfs subvolume create /mnt/@
+            btrfs subvolume create /mnt/@snapshots
+            btrfs subvolume create /mnt/@swap
+            umount /mnt
         fi
     else
         # 安装红帽系或ubuntu
@@ -5325,7 +5347,7 @@ mount_part_basic_layout() {
 
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 /dev/${xda}*${os_part_num} $os_dir
+    mount -t btrfs -o noatime,compress=zstd,subvol=@ /dev/${xda}*${os_part_num} $os_dir
 
     # 挂载 efi 分区
     if is_efi; then

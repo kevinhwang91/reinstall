@@ -3,9 +3,8 @@
 # shellcheck disable=SC2086
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/kevinhwang91/reinstall/main
+confhome_cn=https://cnb.cool/kevinhwang91/reinstall/-/git/raw/main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
@@ -83,7 +82,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--rdp-port   PORT]
                        [--add-driver INF_OR_DIR]
 
-Manual: https://github.com/bin456789/reinstall
+Manual: https://github.com/kevinhwang91/reinstall
 
 EOF
     exit 1
@@ -179,22 +178,7 @@ mask2cidr() {
 }
 
 is_in_china() {
-    [ "$force_cn" = 1 ] && return 0
-
-    if [ -z "$_loc" ]; then
-        # www.cloudflare.com/dash.cloudflare.com 国内访问的是美国服务器，而且部分地区被墙
-        # 没有ipv6 www.visa.cn
-        # 没有ipv6 www.bose.cn
-        # 没有ipv6 www.garmin.com.cn
-        # 备用 www.prologis.cn
-        # 备用 www.autodesk.com.cn
-        # 备用 www.keysight.com.cn
-        if ! _loc=$(curl -L http://www.qualcomm.cn/cdn-cgi/trace | grep '^loc=' | cut -d= -f2 | grep .); then
-            error_and_exit "Can not get location."
-        fi
-        echo "Location: $_loc" >&2
-    fi
-    [ "$_loc" = CN ]
+    return 1
 }
 
 is_in_windows() {

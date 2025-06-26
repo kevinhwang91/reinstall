@@ -3,9 +3,8 @@
 # shellcheck disable=SC2086
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
-# confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/kevinhwang91/reinstall/main
+confhome_cn=https://cnb.cool/kevinhwang91/reinstall/-/git/raw/main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
@@ -88,13 +87,14 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--ssh-port  PORT]
                        [--web-port  PORT]
                        [--frpc-toml PATH]
+                       [--snapshot-path PATH]
 
                        For Windows Only:
                        [--allow-ping]
                        [--rdp-port   PORT]
                        [--add-driver INF_OR_DIR]
 
-Manual: https://github.com/bin456789/reinstall
+Manual: https://github.com/kevinhwang91/reinstall
 
 EOF
     exit 1
@@ -190,22 +190,7 @@ mask2cidr() {
 }
 
 is_in_china() {
-    [ "$force_cn" = 1 ] && return 0
-
-    if [ -z "$_loc" ]; then
-        # www.cloudflare.com/dash.cloudflare.com 国内访问的是美国服务器，而且部分地区被墙
-        # 没有ipv6 www.visa.cn
-        # 没有ipv6 www.bose.cn
-        # 没有ipv6 www.garmin.com.cn
-        # 备用 www.prologis.cn
-        # 备用 www.autodesk.com.cn
-        # 备用 www.keysight.com.cn
-        if ! _loc=$(curl -L http://www.qualcomm.cn/cdn-cgi/trace | grep '^loc=' | cut -d= -f2 | grep .); then
-            error_and_exit "Can not get location."
-        fi
-        echo "Location: $_loc" >&2
-    fi
-    [ "$_loc" = CN ]
+    return 1
 }
 
 is_in_windows() {
@@ -2252,14 +2237,14 @@ check_ram() {
 
     # ram 足够就用普通方法安装，否则如果内存大于512就用 cloud image
     # TODO: 测试 256 384 内存
-    if ! is_use_cloud_image && [ $ram_size -lt $ram_standard ]; then
-        if $has_cloud_image; then
-            info "RAM < $ram_standard MB. Fallback to cloud image mode"
-            cloud_image=1
-        else
-            error_and_exit "Could not install $distro: RAM < $ram_standard MB."
-        fi
-    fi
+    # if ! is_use_cloud_image && [ $ram_size -lt $ram_standard ]; then
+    #     if $has_cloud_image; then
+    #         info "RAM < $ram_standard MB. Fallback to cloud image mode"
+    #         cloud_image=1
+    #     else
+    #         error_and_exit "Could not install $distro: RAM < $ram_standard MB."
+    #     fi
+    # fi
 
     if is_use_cloud_image && [ $ram_size -lt $ram_cloud_image ]; then
         error_and_exit "Could not install $distro using cloud image: RAM < $ram_cloud_image MB."
@@ -2513,6 +2498,30 @@ find_main_disk() {
         ! grep -Eix '[0-9a-f-]{36}' <<<"$main_disk"; then
         error_and_exit "Disk ID is invalid: $main_disk"
     fi
+}
+
+get_btrfs_snapshot_info() {
+    if ! is_have_cmd btrfs || ! is_have_cmd findmnt; then
+        install_pkg btrfs-progs util-linux >&2
+    fi
+
+    local path=$(readlink -f "$1")
+    if [ ! -e "$path" ]; then
+        error_and_exit "Snapshot path does not exist: $path"
+    fi
+
+    local subvol_info=$(btrfs subvolume show "$path" 2>/dev/null) \
+        || error_and_exit "The provided path is NOT a Btrfs snapshot/subvolume: $path"
+
+    local snap_id=$(echo "$subvol_info" | awk '/Subvolume ID:/ {print $NF}')
+
+    local snap_uuid=$(findmnt -n -o UUID --target "$path")
+
+    if [ -z "$snap_id" ] || [ -z "$snap_uuid" ]; then
+        error_and_exit "Failed to extract Btrfs ID or Disk UUID from: $path"
+    fi
+
+    echo "$snap_id" "$snap_uuid"
 }
 
 is_found_ipv4_netconf() {
@@ -3038,6 +3047,16 @@ build_extra_cmdline() {
                 extra_cmdline+=" extra_$key=$value"
         fi
     done
+
+    if [ -n "$snapshot_path" ]; then
+        read -r snap_id snap_uuid <<< $(get_btrfs_snapshot_info "$snapshot_path")
+        info "Snapshot Verified:"
+        echo "  Path: $snapshot_path"
+        echo "  ID:   $snap_id"
+        echo "  UUID: $snap_uuid"
+        finalos_cmdline+=" finalos_snapshot_id=$snap_id finalos_snapshot_uuid=$snap_uuid"
+        snapshot_path=""
+    fi
 
     # 指定最终安装系统的 mirrorlist，链接有&，在grub中是特殊字符，所以要加引号
     if [ -n "$finalos_mirrorlist" ]; then
@@ -3898,6 +3917,7 @@ for o in ci installer debug minimal allow-ping force-cn help \
     allow-ping: \
     commit: \
     frpc-conf: frpc-config: frpc-toml: \
+    snapshot-path: \
     force-boot-mode: \
     force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
@@ -3980,7 +4000,11 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
-
+        shift 2
+        ;;
+    --snapshot-path)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot-path"
+        snapshot_path=$(get_unix_path "$2")
         shift 2
         ;;
     --force-boot-mode)

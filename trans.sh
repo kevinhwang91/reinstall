@@ -1987,6 +1987,8 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 EOF
         mkdir -p /etc/pacman.d
+        mkdir -p $os_dir/var/lib/portables $os_dir/var/lib/machines
+
         # shellcheck disable=SC2016
         case "$(uname -m)" in
         x86_64) dir='$repo/os/$arch' ;;
@@ -2028,7 +2030,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux-lts
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs
     }
 
     # shellcheck disable=SC2317
@@ -2252,14 +2254,21 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if grep -q '^[#[:space:]]*GRUB_TIMEOUT=' "$file"; then
+        sed -i 's/^[#[:space:]]*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' $file
+    else
+        echo 'GRUB_TIMEOUT=1' >>$file
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
 
-    # fstab
-    # fstab 可不写 efi 条目， systemd automount 会自动挂载
-    # fstab 头部有使用说明，因此用 >>
-    apk add arch-install-scripts
-    genfstab -U $os_dir | sed '/swap/d' >>$os_dir/etc/fstab
-    apk del arch-install-scripts
+    if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
+        mkdir -p "$os_dir/.snapshots"
+        btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+        mount -t btrfs -o noatime,compress=zstd,subvol=@snapshots "$btrfs_part" "$os_dir/.snapshots"
+        mkdir -p "$os_dir/swap"
+        mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
+    fi
 
     # 删除 resolv.conf，不然 systemd-resolved 无法创建软链接
     rm_resolv_conf $os_dir
@@ -2267,6 +2276,13 @@ EOF
     # 删除 swap
     swapoff -a
     rm -rf $os_dir/swapfile
+
+    # fstab
+    # fstab 可不写 efi 条目， systemd automount 会自动挂载
+    # fstab 头部有使用说明，因此用 >>
+    apk add arch-install-scripts
+    genfstab -U $os_dir  >>$os_dir/etc/fstab
+    apk del arch-install-scripts
 }
 
 get_http_file_size() {
@@ -2446,7 +2462,7 @@ create_part() {
     info "Create Part"
 
     # 分区工具
-    apk add parted e2fsprogs
+    apk add parted e2fsprogs btrfs-progs
     if is_efi; then
         apk add dosfstools
     fi
@@ -2649,14 +2665,37 @@ create_part() {
             echo                                #1 bios_boot
             mkfs.ext4 -F $ext4_opts /dev/$xda*2 #2 os
         else
-            # bios
-            parted /dev/$xda -s -- \
-                mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
-                set 1 boot on
-            update_part
+            if [ "$distro" = alpine ]; then
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary ext4 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+            else
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary btrfs 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.btrfs -f -L os /dev/$xda*1
 
-            mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+                sleep 5
+                wipefs -a /dev/$xda*1
+                wipefs -a /dev/$xda
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary btrfs 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.btrfs -f -L os /dev/$xda*1
+
+                mount /dev/$xda*1 /mnt
+                btrfs subvolume create /mnt/@
+                btrfs subvolume create /mnt/@snapshots
+                btrfs subvolume create /mnt/@swap
+                umount /mnt
+            fi
         fi
     else
         # 安装红帽系或ubuntu
@@ -5326,10 +5365,15 @@ mount_part_basic_layout() {
     else
         os_part_num=1
     fi
-
+    part_dev=$(ls /dev/${xda}*${os_part_num} 2>/dev/null | head -n 1)
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 /dev/${xda}*${os_part_num} $os_dir
+    fs_type=$(lsblk -rn -o FSTYPE "$part_dev")
+    if [ "$distro" = alpine ]; then
+        mount -t ext4 $part_dev $os_dir
+    else
+        mount -t btrfs -o noatime,compress=zstd,subvol=@ $part_dev $os_dir
+    fi
 
     # 挂载 efi 分区
     if is_efi; then
@@ -7175,6 +7219,7 @@ trans() {
             install_alpine
             ;;
         arch | gentoo | aosc)
+            modprobe btrfs
             create_part
             install_arch_gentoo_aosc
             ;;
@@ -7207,6 +7252,57 @@ trans() {
     info 'done'
     # 让 web 输出全部内容
     sleep 5
+}
+
+rollback_btrfs_from_snapshot() {
+    echo "[rollback] Start time: $(date)"
+    if ! apk add lsblk btrfs-progs util-linux; then
+        echo "[rollback] Error: Failed to install dependency packages."
+        return 1
+    fi
+    modprobe btrfs
+    local mnt=/mnt
+    mkdir -p "$mnt"
+    echo "[rollback] Mode: Precise ID ($snapshot_id) on UUID ($snapshot_uuid)"
+
+    local target_dev=$(blkid -U "$snapshot_uuid")
+    if [ -z "$target_dev" ]; then
+        echo "[rollback] Error: Device with UUID $snapshot_uuid not found."
+        return 1
+    fi
+
+    if mount -t btrfs -o subvolid=5 "$target_dev" "$mnt"; then
+        local rel_path
+        if ! rel_path=$(btrfs inspect-internal subvolid-resolve "$snapshot_id" "$mnt" 2>/dev/null); then
+            echo "[rollback] Error: Failed to resolve path for ID $snapshot_id"
+            return 1
+        fi
+        rel_path=$(echo "$rel_path" | tr -d '[:space:]')
+        local src_path="$mnt/${rel_path#/}"
+        if [ ! -d "$src_path" ]; then
+            echo "[rollback] Error: Source snapshot path not found at expected location: $src_path"
+            return 1
+        fi
+        echo "[rollback] Found snapshot source at: $src_path"
+
+        if [ -d "$mnt/@" ]; then
+            echo "[rollback] Deleting old system subvolume '@'..."
+            if ! btrfs subvolume delete "$mnt/@"; then
+                 echo "[rollback] Error: Failed to delete old system."
+                 return 1
+            fi
+        else
+            echo "[rollback] Warning: Current system '@' subvolume not found, skipping backup."
+        fi
+
+        echo "[rollback] Restoring snapshot '$src_path' -> '$mnt/@'"
+        btrfs subvolume snapshot "$src_path" "$mnt/@" && echo "[rollback] Success!" || \
+            echo "[rollback] Error: Snapshot restoration command failed."
+        return 0
+    else
+        echo "[rollback] Error: Failed to mount subvolid=5 on $target_dev"
+        return 1
+    fi
 }
 
 # 脚本入口
@@ -7285,6 +7381,17 @@ if [ -s /configs/frpc.toml ] && ! pidof frpc >/dev/null; then
         frpc -c /configs/frpc.toml || true
         sleep 5
     done &
+fi
+
+if [ "$distro" = alpine ] && [ -n "$snapshot_id" ] && [ -n "$snapshot_uuid" ]; then
+    {
+        if rollback_btrfs_from_snapshot; then
+            reboot -f
+        else
+            sync
+            exit 1
+        fi
+    } 2>&1 | tee -a /root/rollback.log
 fi
 
 # shellcheck disable=SC2154

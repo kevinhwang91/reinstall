@@ -52,7 +52,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        centos      9|10
                        fedora      41|42
                        nixos       25.05
-                       debian      9|10|11|12
+                       debian      9|10|11|12|13
                        opensuse    15.6|tumbleweed
                        alpine      3.19|3.20|3.21|3.22
                        openeuler   20.03|22.03|24.03|25.03
@@ -849,6 +849,7 @@ get_windows_iso_link() {
                 serverdatacenter | serverdatacentercore) echo _ ;;
                 esac
                 ;;
+            # massgrave 不提供 2012 下载
             '2012 r2' | \
                 2016 | 2019 | 2022 | 2025)
                 case "$edition" in
@@ -873,13 +874,25 @@ get_windows_iso_link() {
                 case "$edition" in
                 starter)
                     case "$arch_win" in
-                    x86) echo ultimate ;;
+                    x86) echo starter ;;
                     esac
                     ;;
-                homebasic | homepremium | professional | ultimate) echo ultimate ;;
+                homebasic)
+                    case "$arch_win" in
+                    x86) echo "home basic" ;;
+                    esac
+                    ;;
+                homepremium) echo "home premium" ;;
+                professional | enterprise | ultimate) echo "$edition" ;;
                 esac
                 ;;
-            # 8.1 需到 msdl.gravesoft.dev 下载
+            # massgrave 不提供 windows 8 下载
+            8.1)
+                case "$edition" in
+                '') echo _ ;; # windows 8.1 core
+                pro | enterprise) echo "$edition" ;;
+                esac
+                ;;
             10)
                 case "$edition" in
                 home | 'home single language') echo consumer ;;
@@ -931,6 +944,8 @@ get_windows_iso_link() {
         esac
     }
 
+    # 8.1 和 11 arm 没有每月发布 iso
+    # 因此优先从 msdl 下载
     get_label_msdl() {
         case "$version" in
         8.1)
@@ -976,7 +991,13 @@ get_windows_iso_link() {
     label_vlsc=$(get_label_vlsc)
     page=$(get_page)
 
-    page_url=https://massgrave.dev/windows_${page}_links
+    if [ "$page" = vista ]; then
+        page_url=https://massgrave.dev/windows_vista__links
+    elif [ "$page" = server ]; then
+        page_url=https://massgrave.dev/windows-server-links
+    else
+        page_url=https://massgrave.dev/windows_${page}_links
+    fi
 
     info "Find windows iso"
     echo "Version:    $version"
@@ -1102,6 +1123,9 @@ setos() {
         10) codename=buster ;;
         11) codename=bullseye ;;
         12) codename=bookworm ;;
+        13) codename=trixie ;;
+        14) codename=forky ;;
+        15) codename=duke ;;
         esac
 
         if ! is_use_cloud_image && is_debian_elts && is_in_china; then
@@ -1549,7 +1573,17 @@ Continue with DD?
             fi
         done
 
-        iso=$(curl -L https://fnnas.com/ | grep -o 'https://[^"]*\.iso' | head -1)
+        iso=$(curl -L https://fnnas.com/ | grep -o 'https://[^"]*\.iso' | head -1 | grep .)
+
+        # curl 7.82.0+
+        # curl -L --json '{"url":"'$iso'"}' https://www.fnnas.com/api/download-sign
+
+        iso=$(curl -L \
+            -d '{"url":"'$iso'"}' \
+            -H 'Content-Type: application/json' \
+            https://www.fnnas.com/api/download-sign |
+            grep -o 'https://[^"]*')
+
         test_url "$iso" iso
         eval "${step}_iso='$iso'"
     }
@@ -1712,7 +1746,12 @@ Continue with DD?
 
         if is_use_cloud_image; then
             # ci
-            dir=$releasever/images/$basearch
+            if [ "$releasever" -eq 9 ]; then
+                dir=$releasever/images/qcow2/$basearch
+            else
+                dir=$releasever/images/$basearch
+            fi
+
             file=$(curl -L $mirror/$dir/ | grep -oP 'OpenCloudOS.*?\.qcow2' |
                 sort -uV | tail -1 | grep .)
             eval ${step}_img=$mirror/$dir/$file
@@ -1812,7 +1851,7 @@ verify_os_name() {
         'oracle      8|9' \
         'fedora      41|42' \
         'nixos       25.05' \
-        'debian      9|10|11|12' \
+        'debian      9|10|11|12|13' \
         'opensuse    15.6|16.0|tumbleweed' \
         'alpine      3.19|3.20|3.21|3.22' \
         'openeuler   20.03|22.03|24.03|25.03' \
@@ -2078,6 +2117,10 @@ install_pkg() {
     done >&2
 }
 
+is_valid_ram_size() {
+    is_digit "$1" && [ "$1" -gt 0 ]
+}
+
 check_ram() {
     ram_standard=$(
         case "$distro" in
@@ -2105,7 +2148,7 @@ check_ram() {
     )
 
     if is_in_windows; then
-        ram_size=$(wmic memorychip get capacity | awk -F= '{sum+=$2} END {print sum/1024/1024}')
+        ram_size=$(wmic memorychip get capacity | awk -F= '{sum+=$2} END {if(sum>0) print sum/1024/1024}')
     else
         # lsmem最准确但 centos7 arm 和 alpine 不能用，debian 9 util-linux 没有 lsmem
         # arm 24g dmidecode 显示少了128m
@@ -2114,12 +2157,12 @@ check_ram() {
         install_pkg lsmem
         ram_size=$(lsmem -b 2>/dev/null | grep 'Total online memory:' | awk '{ print $NF/1024/1024 }')
 
-        if [ -z $ram_size ]; then
+        if ! is_valid_ram_size "$ram_size"; then
             install_pkg dmidecode
-            ram_size=$(dmidecode -t 17 | grep "Size.*[GM]B" | awk '{if ($3=="GB") s+=$2*1024; else s+=$2} END {print s}')
+            ram_size=$(dmidecode -t 17 | grep "Size.*[GM]B" | awk '{if ($3=="GB") s+=$2*1024; else s+=$2} END {if(s>0) print s}')
         fi
 
-        if [ -z $ram_size ]; then
+        if ! is_valid_ram_size "$ram_size"; then
             install_pkg lshw
             # 不能忽略 -i，alpine 显示的是 System memory
             ram_str=$(lshw -c memory -short | grep -i 'System Memory' | awk '{print $3}')
@@ -2130,12 +2173,12 @@ check_ram() {
 
     # 用于兜底，不太准确
     # cygwin 要装 procps-ng 才有 free 命令
-    if [ -z $ram_size ]; then
+    if ! is_valid_ram_size "$ram_size"; then
         ram_size_k=$(grep '^MemTotal:' /proc/meminfo | awk '{print $2}')
         ram_size=$((ram_size_k / 1024 + 64 + 4))
     fi
 
-    if [ -z $ram_size ] || [ $ram_size -le 0 ]; then
+    if ! is_valid_ram_size "$ram_size"; then
         error_and_exit "Could not detect RAM size."
     fi
 
@@ -3096,6 +3139,7 @@ partman-xfs
 rescue-check
 wpasupplicant-udeb
 lilo-installer
+systemd-boot-installer
 nic-modules-$kver-di
 nic-pcmcia-modules-$kver-di
 nic-usb-modules-$kver-di
@@ -3146,7 +3190,7 @@ EOF
         fi
 
         # 下载 udeb
-        curl -Lo $tmp/tmp.udeb http://$nextos_udeb_mirror/"$(grep /$package $udeb_list)"
+        curl -Lo $tmp/tmp.udeb http://$nextos_udeb_mirror/"$(grep -F /${package}_ $udeb_list)"
 
         if false; then
             # 使用 dpkg

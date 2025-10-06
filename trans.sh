@@ -2028,7 +2028,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux
+        chroot $os_dir pacman -Syu --noconfirm linux-lts
     }
 
     # shellcheck disable=SC2317

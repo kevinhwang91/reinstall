@@ -2949,7 +2949,7 @@ build_extra_cmdline() {
     # 会将 extra.xxx=yyy 写入新系统的 /etc/modprobe.d/local.conf
     # https://answers.launchpad.net/ubuntu/+question/249456
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
-    for key in confhome hold force force_cn force_old_windows_setup cloud_image main_disk \
+    for key in confhome hold snapshot_path force force_cn force_old_windows_setup cloud_image main_disk \
         elts deb_mirror \
         ssh_port rdp_port web_port allow_ping; do
         value=${!key}
@@ -3767,6 +3767,7 @@ for o in ci installer debug minimal allow-ping force-cn help \
     allow-ping: \
     commit: \
     frpc-conf: frpc-config: frpc-toml: \
+    snapshot-path: \
     force: \
     force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
@@ -3839,7 +3840,11 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
-
+        shift 2
+        ;;
+    --snapshot-path)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot-path"
+        snapshot_path=$(get_unix_path "$2")
         shift 2
         ;;
     --force)

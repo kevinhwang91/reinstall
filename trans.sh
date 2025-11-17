@@ -1985,7 +1985,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux-lts
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs
     }
 
     # shellcheck disable=SC2317
@@ -2209,7 +2209,17 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if grep -q '^[#[:space:]]*GRUB_TIMEOUT=' "$file"; then
+        sed -i 's/^[#[:space:]]*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' $file
+    else
+        echo 'GRUB_TIMEOUT=1' >>$file
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
+
+    mkdir -p "$os_dir/.snapshots"
+    part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+    mount -t btrfs -o noatime,compress=zstd,subvol=@snapshots "$part" "$os_dir/.snapshots"
 
     # fstab
     # fstab 可不写 efi 条目， systemd automount 会自动挂载
@@ -2613,10 +2623,10 @@ create_part() {
             update_part
 
             mkfs.btrfs -f -L os /dev/$xda*1
-            mount /dev/$xda*1 /mnt
 
-            # 3. 在顶层卷中创建子卷
+            mount /dev/$xda*1 /mnt
             btrfs subvolume create /mnt/@
+            btrfs subvolume create /mnt/@snapshots
             umount /mnt
         fi
     else
@@ -7131,6 +7141,38 @@ trans() {
     sleep 5
 }
 
+rollback_btrfs_from_snapshot() {
+    log=${log:-/root/rollback.log}
+    {
+        echo "[rollback] start $(date)"
+        echo "snapshot_path=${snapshot_path}"
+
+        apk add lsblk btrfs-progs
+
+        [ -n "${xda:-}" ] || find_xda || { echo "find_xda failed"; exit 0; }
+
+        mnt=/mnt
+        mkdir -p "$mnt"
+        for p in /dev/${xda}?* /dev/${xda}; do
+            [ -b "$p" ] || continue
+            if mount -t btrfs -o subvolid=5 "$p" "$mnt"; then
+                if [ -d "$mnt/$snapshot_path" ]; then
+                    ts=$(date +%Y%m%d-%H%M%S)
+                    [ -d "$mnt/@" ] && mv "$mnt/@" "$mnt/@.old.$ts"
+                    btrfs subvolume snapshot "$mnt/$snapshot_path" "$mnt/@"
+                    umount -R "$mnt"
+                    echo "[rollback] success; reboot"
+                    reboot -f
+                    exit 0
+                fi
+                umount -R "$mnt"
+            fi
+        done
+        echo "[rollback] not found: $snapshot_path"
+        exit 0
+    } >>"$log" 2>&1
+}
+
 # 脚本入口
 # debian initrd 会寻找 main
 # 并调用本文件的 create_ifupdown_config 方法
@@ -7207,6 +7249,10 @@ if [ -s /configs/frpc.toml ] && ! pidof frpc >/dev/null; then
         frpc -c /configs/frpc.toml || true
         sleep 5
     done &
+fi
+
+if [ "$distro" = alpine ] && [ -n "$snapshot_path" ]; then
+    rollback_btrfs_from_snapshot
 fi
 
 # shellcheck disable=SC2154

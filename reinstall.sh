@@ -76,6 +76,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--ssh-port  PORT]
                        [--web-port  PORT]
                        [--frpc-toml PATH]
+                       [--snapshot-path PATH]
 
                        For Windows Only:
                        [--allow-ping]
@@ -2488,6 +2489,30 @@ find_main_disk() {
     fi
 }
 
+get_btrfs_snapshot_info() {
+    if ! is_have_cmd btrfs || ! is_have_cmd findmnt; then
+        install_pkg btrfs-progs util-linux >&2
+    fi
+
+    local path=$(readlink -f "$1")
+    if [ ! -e "$path" ]; then
+        error_and_exit "Snapshot path does not exist: $path"
+    fi
+
+    local subvol_info=$(btrfs subvolume show "$path" 2>/dev/null) \
+        || error_and_exit "The provided path is NOT a Btrfs snapshot/subvolume: $path"
+
+    local snap_id=$(echo "$subvol_info" | awk '/Subvolume ID:/ {print $NF}')
+
+    local snap_uuid=$(findmnt -n -o UUID --target "$path")
+
+    if [ -z "$snap_id" ] || [ -z "$snap_uuid" ]; then
+        error_and_exit "Failed to extract Btrfs ID or Disk UUID from: $path"
+    fi
+
+    echo "$snap_id" "$snap_uuid"
+}
+
 is_found_ipv4_netconf() {
     [ -n "$ipv4_mac" ] && [ -n "$ipv4_addr" ] && [ -n "$ipv4_gateway" ]
 }
@@ -3001,7 +3026,7 @@ build_extra_cmdline() {
     # 会将 extra.xxx=yyy 写入新系统的 /etc/modprobe.d/local.conf
     # https://answers.launchpad.net/ubuntu/+question/249456
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
-    for key in confhome hold force_boot_mode force_cn force_old_windows_setup cloud_image main_disk \
+    for key in confhome hold force force_cn force_old_windows_setup cloud_image main_disk \
         elts deb_mirror \
         ssh_port rdp_port web_port allow_ping; do
         value=${!key}
@@ -3011,6 +3036,16 @@ build_extra_cmdline() {
                 extra_cmdline+=" extra_$key=$value"
         fi
     done
+
+    if [ -n "$snapshot_path" ]; then
+        read -r snap_id snap_uuid <<< $(get_btrfs_snapshot_info "$snapshot_path")
+        info "Snapshot Verified:"
+        echo "  Path: $snapshot_path"
+        echo "  ID:   $snap_id"
+        echo "  UUID: $snap_uuid"
+        finalos_cmdline+=" finalos_snapshot_id=$snap_id finalos_snapshot_uuid=$snap_uuid"
+        snapshot_path=""
+    fi
 
     # 指定最终安装系统的 mirrorlist，链接有&，在grub中是特殊字符，所以要加引号
     if [ -n "$finalos_mirrorlist" ]; then
@@ -3871,7 +3906,8 @@ for o in ci installer debug minimal allow-ping force-cn help \
     allow-ping: \
     commit: \
     frpc-conf: frpc-config: frpc-toml: \
-    force-boot-mode: \
+    snapshot-path: \
+    force: \
     force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
     long_opts+=$o
@@ -3953,7 +3989,11 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
-
+        shift 2
+        ;;
+    --snapshot-path)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot-path"
+        snapshot_path=$(get_unix_path "$2")
         shift 2
         ;;
     --force-boot-mode)

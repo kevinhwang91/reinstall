@@ -2029,7 +2029,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux-lts
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs
     }
 
     # shellcheck disable=SC2317
@@ -2671,9 +2671,8 @@ create_part() {
             update_part
 
             mkfs.btrfs -f -L os /dev/$xda*1
-            mount /dev/$xda*1 /mnt
 
-            # 3. 在顶层卷中创建子卷
+            mount /dev/$xda*1 /mnt
             btrfs subvolume create /mnt/@
             btrfs subvolume create /mnt/@snapshots
             btrfs subvolume create /mnt/@swap
@@ -7227,6 +7226,57 @@ trans() {
     sleep 5
 }
 
+rollback_btrfs_from_snapshot() {
+    echo "[rollback] Start time: $(date)"
+    if ! apk add lsblk btrfs-progs util-linux; then
+        echo "[rollback] Error: Failed to install dependency packages."
+        return 1
+    fi
+    modprobe btrfs
+    local mnt=/mnt
+    mkdir -p "$mnt"
+    echo "[rollback] Mode: Precise ID ($snapshot_id) on UUID ($snapshot_uuid)"
+
+    local target_dev=$(blkid -U "$snapshot_uuid")
+    if [ -z "$target_dev" ]; then
+        echo "[rollback] Error: Device with UUID $snapshot_uuid not found."
+        return 1
+    fi
+
+    if mount -t btrfs -o subvolid=5 "$target_dev" "$mnt"; then
+        local rel_path
+        if ! rel_path=$(btrfs inspect-internal subvolid-resolve "$snapshot_id" "$mnt" 2>/dev/null); then
+            echo "[rollback] Error: Failed to resolve path for ID $snapshot_id"
+            return 1
+        fi
+        rel_path=$(echo "$rel_path" | tr -d '[:space:]')
+        local src_path="$mnt/${rel_path#/}"
+        if [ ! -d "$src_path" ]; then
+            echo "[rollback] Error: Source snapshot path not found at expected location: $src_path"
+            return 1
+        fi
+        echo "[rollback] Found snapshot source at: $src_path"
+
+        if [ -d "$mnt/@" ]; then
+            echo "[rollback] Deleting old system subvolume '@'..."
+            if ! btrfs subvolume delete "$mnt/@"; then
+                 echo "[rollback] Error: Failed to delete old system."
+                 return 1
+            fi
+        else
+            echo "[rollback] Warning: Current system '@' subvolume not found, skipping backup."
+        fi
+
+        echo "[rollback] Restoring snapshot '$src_path' -> '$mnt/@'"
+        btrfs subvolume snapshot "$src_path" "$mnt/@" && echo "[rollback] Success!" || \
+            echo "[rollback] Error: Snapshot restoration command failed."
+        return 0
+    else
+        echo "[rollback] Error: Failed to mount subvolid=5 on $target_dev"
+        return 1
+    fi
+}
+
 # 脚本入口
 # debian initrd 会寻找 main
 # 并调用本文件的 create_ifupdown_config 方法
@@ -7303,6 +7353,17 @@ if [ -s /configs/frpc.toml ] && ! pidof frpc >/dev/null; then
         frpc -c /configs/frpc.toml || true
         sleep 5
     done &
+fi
+
+if [ "$distro" = alpine ] && [ -n "$snapshot_id" ] && [ -n "$snapshot_uuid" ]; then
+    {
+        if rollback_btrfs_from_snapshot; then
+            reboot -f
+        else
+            sync
+            exit 1
+        fi
+    } 2>&1 | tee -a /root/rollback.log
 fi
 
 # shellcheck disable=SC2154

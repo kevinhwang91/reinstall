@@ -1955,8 +1955,9 @@ install_arch_gentoo_aosc() {
     )
 
     set_locale() {
-        echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' $os_dir/etc/locale.gen
         chroot $os_dir locale-gen
+        echo 'LANG=en_US.UTF-8' > $os_dir/etc/locale.conf
     }
 
     # shellcheck disable=SC2317

@@ -2056,8 +2056,9 @@ install_arch_gentoo_aosc() {
     )
 
     set_locale() {
-        echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' $os_dir/etc/locale.gen
         chroot $os_dir locale-gen
+        echo 'LANG=en_US.UTF-8' > $os_dir/etc/locale.conf
     }
 
     # shellcheck disable=SC2317
@@ -2087,6 +2088,8 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 EOF
         mkdir -p /etc/pacman.d
+        mkdir -p $os_dir/var/lib/portables $os_dir/var/lib/machines
+
         # shellcheck disable=SC2016
         case "$(uname -m)" in
         x86_64) dir='$repo/os/$arch' ;;
@@ -2128,7 +2131,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs
     }
 
     # shellcheck disable=SC2317
@@ -2293,6 +2296,25 @@ EOF
         chroot $os_dir update-initramfs
     }
 
+    add_arch_snapshots_fstab() {
+        [ "$distro" = arch ] || return
+        [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ] || return
+
+        local btrfs_part uuid
+
+        mkdir -p "$os_dir/.snapshots"
+        btrfs_part=$(findmnt -no SOURCE --target "$os_dir" | sed 's/\[.*\]//')
+        [ -n "$btrfs_part" ] || return
+        if ! uuid=$(blkid -s UUID -o value "$btrfs_part"); then
+            return
+        fi
+        [ -n "$uuid" ] || return
+
+        if ! grep -q '[[:space:]]/\.snapshots[[:space:]]' "$os_dir/etc/fstab"; then
+            echo "# UUID=$uuid /.snapshots btrfs noatime,compress=zstd,subvol=@snapshots 0 0" >>"$os_dir/etc/fstab"
+        fi
+    }
+
     os_dir=/os
 
     # 挂载分区
@@ -2377,14 +2399,19 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if grep -q '^[#[:space:]]*GRUB_TIMEOUT=' "$file"; then
+        sed -i 's/^[#[:space:]]*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' $file
+    else
+        echo 'GRUB_TIMEOUT=1' >>$file
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
 
-    # fstab
-    # fstab 可不写 efi 条目， systemd automount 会自动挂载
-    # fstab 头部有使用说明，因此用 >>
-    apk add arch-install-scripts
-    genfstab -U $os_dir | sed '/swap/d' >>$os_dir/etc/fstab
-    apk del arch-install-scripts
+    if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
+        btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+        mkdir -p "$os_dir/swap"
+        mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
+    fi
 
     # 删除 resolv.conf，不然 systemd-resolved 无法创建软链接
     rm_resolv_conf $os_dir
@@ -2392,6 +2419,14 @@ EOF
     # 删除 swap
     swapoff -a
     rm -rf $os_dir/swapfile
+
+    # fstab
+    # fstab 可不写 efi 条目， systemd automount 会自动挂载
+    # fstab 头部有使用说明，因此用 >>
+    apk add arch-install-scripts
+    genfstab -U $os_dir >>$os_dir/etc/fstab
+    add_arch_snapshots_fstab
+    apk del arch-install-scripts
 }
 
 get_http_file_size() {
@@ -2582,12 +2617,38 @@ xda() {
     fi
 }
 
+mkfs_arch_btrfs() {
+    local part_dev=$1
+
+    mkfs.btrfs -f -L os "$part_dev"
+    mkdir -p /mnt
+    mount "$part_dev" /mnt
+    btrfs subvolume create /mnt/@
+    btrfs subvolume create /mnt/@swap
+    btrfs subvolume create /mnt/@snapshots
+    mkdir -p /mnt/@/.snapshots
+    umount /mnt
+}
+
+mkfs_linux_os_part() {
+    local part_dev=$1
+
+    if [ "$distro" = arch ]; then
+        mkfs_arch_btrfs "$part_dev"
+    else
+        mkfs.ext4 -F $ext4_opts "$part_dev"
+    fi
+}
+
 create_part() {
     # 除了 dd 都会用到
     info "Create Part"
 
     # 分区工具
     apk add parted e2fsprogs
+    if [ "$distro" = arch ]; then
+        apk add btrfs-progs
+    fi
     if is_efi; then
         apk add dosfstools
     fi
@@ -2783,37 +2844,53 @@ create_part() {
         # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
         # 而且 alpine 的 extlinux 不兼容 64bit ext4
         [ "$distro" = alpine ] && ext4_opts="-O ^64bit" || ext4_opts=
+        os_part_type=ext4
+        [ "$distro" = arch ] && os_part_type=btrfs
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 101MiB \
-                mkpart '" "' ext4 101MiB 100% \
+                mkpart '" "' $os_part_type 101MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.fat "/dev/$(xda 1)"                #1 efi
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            mkfs.fat "/dev/$(xda 1)"          #1 efi
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB 2MiB \
-                mkpart '" "' ext4 2MiB 100% \
+                mkpart '" "' $os_part_type 2MiB 100% \
                 set 1 bios_grub on
             update_part
 
-            echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            echo                              #1 bios_boot
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         else
-            # bios
-            parted /dev/$xda -s -- \
-                mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
-                set 1 boot on
-            update_part
-
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            if [ "$distro" = alpine ]; then
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary ext4 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+            elif [ "$distro" = arch ]; then
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary btrfs 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs_arch_btrfs /dev/$xda*1
+            else
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary ext4 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.ext4 -F $ext4_opts /dev/$xda*1 #1 os
+            fi
         fi
     else
         # 安装红帽系或ubuntu
@@ -5548,10 +5625,15 @@ mount_part_basic_layout() {
     else
         os_part_num=1
     fi
-
+    part_dev="/dev/$(xda $os_part_num)"
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 "/dev/$(xda $os_part_num)" $os_dir
+    fs_type=$(lsblk -rn -o FSTYPE "$part_dev")
+    if [ "$fs_type" = btrfs ]; then
+        mount -t btrfs -o noatime,compress=zstd,subvol=@ $part_dev $os_dir
+    else
+        mount -t ext4 $part_dev $os_dir
+    fi
 
     # 挂载 efi 分区
     if is_efi; then
@@ -7714,7 +7796,12 @@ trans() {
         alpine)
             install_alpine
             ;;
-        arch | gentoo | aosc)
+        arch)
+            modprobe btrfs
+            create_part
+            install_arch_gentoo_aosc
+            ;;
+        gentoo | aosc)
             create_part
             install_arch_gentoo_aosc
             ;;

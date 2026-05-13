@@ -264,6 +264,49 @@ get_os_part() {
     awk '($2=="/") { print $1 }' /proc/mounts
 }
 
+get_mount_maj_min() {
+    local target=$1
+    awk -v target="$target" '$5 == target { print $3; exit }' /proc/self/mountinfo
+}
+
+get_block_dev_by_maj_min() {
+    local maj_min=$1 dev_name=
+
+    [ -n "$maj_min" ] || return 1
+
+    dev_name=$(lsblk -rn -o NAME,MAJ:MIN 2>/dev/null | awk -v maj_min="$maj_min" '$2 == maj_min { print $1; exit }')
+    [ -n "$dev_name" ] || return 1
+
+    echo "/dev/$dev_name"
+}
+
+get_mount_block_dev() {
+    local target=$1 source= dev= maj_min=
+
+    source=$(awk -v target="$target" '$2 == target { print $1; exit }' /proc/mounts)
+    if [ -n "$source" ] && [ -e "$source" ]; then
+        dev=$(readlink -f "$source")
+        if [ -n "$dev" ] && [ "$dev" != /dev/root ]; then
+            echo "$dev"
+            return
+        fi
+    fi
+
+    maj_min=$(get_mount_maj_min "$target")
+    if dev=$(get_block_dev_by_maj_min "$maj_min"); then
+        echo "$dev"
+        return
+    fi
+
+    [ -n "$source" ] || return 1
+    echo "$source"
+}
+
+get_disks_by_block_dev() {
+    local dev=$1
+    lsblk -rn --inverse "$dev" -o NAME,TYPE 2>/dev/null | awk '$2 == "disk" { print $1 }' | sort -u
+}
+
 umount_all() {
     # windows defender 打开时，cygwin 运行 mount 很慢，但 cat /proc/mounts 很快
     if mount_lists=$(mount | grep -w "on $1" | awk '{print $3}' | grep .); then
@@ -2525,11 +2568,18 @@ find_main_disk() {
 
             install_pkg lsblk
             # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
-            mapper=$(mount | awk '$3=="/" {print $1}' | grep .)
-            xdas=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u | grep .)
+            # 有些系统 /proc/mounts 会把 / 显示成 /dev/root，所以优先用
+            # mountinfo 的 major:minor 反查真实块设备。
+            if ! mapper=$(get_mount_block_dev /); then
+                error_and_exit "Could not find root partition."
+            fi
+            xdas=$(get_disks_by_block_dev "$mapper")
 
             # 注意 wc -l 的坑
             # wc -l <<<"" 输出 1
+            if [ -z "$xdas" ]; then
+                error_and_exit "Could not find disk for root partition: $mapper"
+            fi
 
             # 检测主硬盘是否横跨多个磁盘
             if [ "$(wc -l <<<"$xdas")" -eq 1 ]; then
@@ -2862,7 +2912,7 @@ get_maybe_efi_dirs_in_linux() {
 get_disk_by_part() {
     dev_part=$1
     install_pkg lsblk >&2
-    lsblk -rn --inverse "$dev_part" | grep -w disk | awk '{print $1}'
+    get_disks_by_block_dev "$dev_part"
 }
 
 get_part_num_by_part() {

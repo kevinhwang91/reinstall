@@ -7,6 +7,49 @@ update_part() {
     udevadm settle
 }
 
+get_mount_maj_min() {
+    local target=$1
+    awk -v target="$target" '$5 == target { print $3; exit }' /proc/self/mountinfo
+}
+
+get_block_dev_by_maj_min() {
+    local maj_min=$1 dev_name=
+
+    [ -n "$maj_min" ] || return 1
+
+    dev_name=$(lsblk -rn -o NAME,MAJ:MIN 2>/dev/null | awk -v maj_min="$maj_min" '$2 == maj_min { print $1; exit }')
+    [ -n "$dev_name" ] || return 1
+
+    echo "/dev/$dev_name"
+}
+
+get_mount_block_dev() {
+    local target=$1 source= dev= maj_min=
+
+    source=$(awk -v target="$target" '$2 == target { print $1; exit }' /proc/mounts)
+    if [ -n "$source" ] && [ -e "$source" ]; then
+        dev=$(readlink -f "$source")
+        if [ -n "$dev" ] && [ "$dev" != /dev/root ]; then
+            echo "$dev"
+            return
+        fi
+    fi
+
+    maj_min=$(get_mount_maj_min "$target")
+    if dev=$(get_block_dev_by_maj_min "$maj_min"); then
+        echo "$dev"
+        return
+    fi
+
+    [ -n "$source" ] || return 1
+    echo "$source"
+}
+
+get_disks_by_block_dev() {
+    local dev=$1
+    lsblk -rn --inverse "$dev" -o NAME,TYPE 2>/dev/null | awk '$2 == "disk" { print $1 }' | sort -u
+}
+
 # el 自带 fdisk parted (el7的part不支持在线扩容)
 # ubuntu 自带 fdisk growpart
 
@@ -19,8 +62,20 @@ update_part() {
 # ubuntu grownpart
 
 # 找出主硬盘
-root_drive=$(mount | awk '$3=="/" {print $1}')
-xda=$(lsblk -r --inverse "$root_drive" | grep -w disk | awk '{print $1}')
+if ! root_drive=$(get_mount_block_dev /); then
+    echo "Cannot find root partition." >&2
+    exit 1
+fi
+xdas=$(get_disks_by_block_dev "$root_drive")
+if [ -z "$xdas" ]; then
+    echo "Cannot find disk for root partition: $root_drive" >&2
+    exit 1
+elif [ "$(wc -l <<<"$xdas")" -ne 1 ]; then
+    echo "Multiple disks found for root partition:" >&2
+    printf '%s\n' "$xdas" >&2
+    exit 1
+fi
+xda=$xdas
 
 # 删除 installer 分区
 installer_num=$(readlink -f /dev/disk/by-label/installer | grep -o '[0-9]*$')

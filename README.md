@@ -39,6 +39,7 @@
 - [功能 4. 一键引导到 netboot.xyz](#功能-4-重启到--netbootxyz)
 - [功能 5. 一键重装到 Windows](#功能-5-安装--windows-iso)
 - [取消重装](#取消重装)
+- [Btrfs 快照回滚](#btrfs-快照回滚)
 
 ## 系统要求
 
@@ -565,6 +566,34 @@ Windows Server 2025 SERVERDATACENTER
 
 ```bash
 bash reinstall.sh reset
+```
+
+### Btrfs 快照回滚
+
+仅支持根子卷为 `@` 的 Btrfs 系统。回滚前会把当前 `@` 改名为 `@rollback-backup-*` 并默认保留。
+
+回滚到最新 Snapper 快照：
+
+```bash
+bash reinstall.sh rollback --snapshot latest
+```
+
+回滚到指定 Snapper 快照编号：
+
+```bash
+bash reinstall.sh rollback --snapshot 123
+```
+
+也可以直接指定快照子卷路径：
+
+```bash
+bash reinstall.sh rollback --snapshot-path /.snapshots/123/snapshot
+```
+
+如果确认成功后不需要保留旧 `@`，可以添加：
+
+```bash
+--rollback-delete-backup
 ```
 
 ## 参数格式

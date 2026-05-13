@@ -7836,6 +7836,120 @@ trans() {
     sleep 5
 }
 
+rollback_btrfs_from_snapshot() {
+    local mnt=${1:-/mnt}
+
+    echo "[rollback] Start time: $(date)"
+    if ! apk add lsblk btrfs-progs util-linux; then
+        echo "[rollback] Error: Failed to install dependency packages."
+        return 1
+    fi
+    modprobe btrfs
+    local backup_path=
+    mkdir -p "$mnt"
+    echo "[rollback] Mode: Precise ID ($snapshot_id) on UUID ($snapshot_uuid)"
+    if [ "$rollback_delete_backup" = 1 ]; then
+        echo "[rollback] Backup policy: delete old @ after successful rollback."
+    else
+        echo "[rollback] Backup policy: keep old @ as @rollback-backup-*."
+    fi
+
+    local target_dev=$(blkid -U "$snapshot_uuid")
+    if [ -z "$target_dev" ]; then
+        echo "[rollback] Error: Device with UUID $snapshot_uuid not found."
+        return 1
+    fi
+
+    if mount -t btrfs -o subvolid=5 "$target_dev" "$mnt"; then
+        local rel_path
+        if ! rel_path=$(btrfs inspect-internal subvolid-resolve "$snapshot_id" "$mnt" 2>/dev/null); then
+            echo "[rollback] Error: Failed to resolve path for ID $snapshot_id"
+            return 1
+        fi
+        rel_path=$(echo "$rel_path" | tr -d '[:space:]')
+        local src_path="$mnt/${rel_path#/}"
+        if [ ! -d "$src_path" ]; then
+            echo "[rollback] Error: Source snapshot path not found at expected location: $src_path"
+            return 1
+        fi
+        echo "[rollback] Found snapshot source at: $src_path"
+
+        local target_uuid=$(blkid -s UUID -o value "$target_dev")
+        if [ -z "$target_uuid" ]; then
+            echo "[rollback] Error: Failed to read filesystem UUID from $target_dev"
+            return 1
+        fi
+
+        if [ -d "$mnt/@" ]; then
+            backup_path="$mnt/@rollback-backup-$(date +%Y%m%d-%H%M%S)-$$"
+            echo "[rollback] Renaming current system subvolume '@' -> '$(basename "$backup_path")'..."
+            if ! mv "$mnt/@" "$backup_path"; then
+                echo "[rollback] Error: Failed to rename current system to backup subvolume."
+                return 1
+            fi
+
+            if ! rel_path=$(btrfs inspect-internal subvolid-resolve "$snapshot_id" "$mnt" 2>/dev/null); then
+                echo "[rollback] Error: Failed to resolve snapshot path after renaming current system."
+                mv "$backup_path" "$mnt/@" || true
+                return 1
+            fi
+            rel_path=$(echo "$rel_path" | tr -d '[:space:]')
+            src_path="$mnt/${rel_path#/}"
+            if [ ! -d "$src_path" ]; then
+                echo "[rollback] Error: Snapshot path missing after renaming current system: $src_path"
+                mv "$backup_path" "$mnt/@" || true
+                return 1
+            fi
+        else
+            echo "[rollback] Warning: Current system '@' subvolume not found, skipping backup rename."
+        fi
+
+        echo "[rollback] Restoring snapshot '$src_path' -> '$mnt/@'"
+        if ! btrfs subvolume snapshot "$src_path" "$mnt/@"; then
+            echo "[rollback] Error: Snapshot restoration command failed."
+            if [ -n "$backup_path" ] && [ -d "$backup_path" ] && [ ! -e "$mnt/@" ]; then
+                mv "$backup_path" "$mnt/@" || true
+            fi
+            return 1
+        fi
+
+        if [ -f "$mnt/@/etc/fstab" ]; then
+            local fstab_root_uuid
+            fstab_root_uuid=$(
+                awk '$2 == "/" && $1 ~ /^UUID=/ { sub(/^UUID=/, "", $1); print $1; exit }' "$mnt/@/etc/fstab"
+            )
+            if [ -n "$fstab_root_uuid" ] && [ "$fstab_root_uuid" != "$target_uuid" ]; then
+                echo "[rollback] Updating /etc/fstab system UUID: $fstab_root_uuid -> $target_uuid"
+                awk -v old_uuid="$fstab_root_uuid" -v new_uuid="$target_uuid" '
+                    $1 == "UUID=" old_uuid {
+                        $1 = "UUID=" new_uuid
+                    }
+                    { print }
+                ' "$mnt/@/etc/fstab" >"$mnt/@/etc/fstab.tmp" &&
+                    mv "$mnt/@/etc/fstab.tmp" "$mnt/@/etc/fstab"
+            fi
+        fi
+
+        if [ -n "$backup_path" ] && [ -d "$backup_path" ]; then
+            if [ "$rollback_delete_backup" = 1 ]; then
+                echo "[rollback] Deleting backup subvolume '$(basename "$backup_path")'..."
+                if ! btrfs subvolume delete "$backup_path"; then
+                    echo "[rollback] Error: Failed to delete backup subvolume."
+                    return 1
+                fi
+            else
+                echo "[rollback] Backup kept at: $backup_path"
+            fi
+        fi
+
+        echo "[rollback] Success!"
+        return 0
+    else
+        echo "[rollback] Error: Failed to mount subvolid=5 on $target_dev"
+        return 1
+    fi
+}
+
 # 脚本入口
 # debian initrd 会寻找 main
 # 并调用本文件的 create_ifupdown_config 方法
@@ -7914,6 +8028,20 @@ if ls /configs/frpc.* >/dev/null 2>&1 && ! pidof frpc >/dev/null; then
         frpc -c /configs/frpc.* || true
         sleep 5
     done &
+fi
+
+if [ "$distro" = alpine ] && [ -n "$snapshot_id" ] && [ -n "$snapshot_uuid" ]; then
+    rollback_mnt=/mnt
+    {
+        if rollback_btrfs_from_snapshot "$rollback_mnt"; then
+            umount "$rollback_mnt" 2>/dev/null || true
+            reboot -f
+        else
+            umount "$rollback_mnt" 2>/dev/null || true
+            sync
+            exit 1
+        fi
+    } 2>&1 | tee -a /root/rollback.log
 fi
 
 # shellcheck disable=SC2154

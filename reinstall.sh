@@ -99,6 +99,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        windows     --image-name="windows xxx yyy" --lang=xx-yy
                        windows     --image-name="windows xxx yyy" --iso="http://xxx.com/xxx.iso"
                        netboot.xyz
+                       rollback    --snapshot latest|ID|--snapshot-path PATH
                        reset
 
        Options:        For Linux/Windows:
@@ -107,6 +108,9 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--ssh-port    PORT]
                        [--web-port    PORT]
                        [--frpc-config PATH]
+                       [--snapshot    latest|ID]
+                       [--snapshot-path PATH]
+                       [--rollback-delete-backup]
 
                        For Windows Only:
                        [--allow-ping]
@@ -1966,6 +1970,7 @@ verify_os_name() {
         'windows' \
         'dd' \
         'netboot.xyz' \
+        'rollback' \
         'reset'; do
         read -r ds vers <<<"$os"
         vers_=${vers//\./\\\.}
@@ -2637,6 +2642,76 @@ find_main_disk() {
     fi
 }
 
+get_btrfs_snapshot_info() {
+    if ! is_have_cmd btrfs || ! is_have_cmd findmnt; then
+        install_pkg btrfs-progs util-linux >&2
+    fi
+
+    local path=$(readlink -f "$1")
+    if [ ! -e "$path" ]; then
+        error_and_exit "Snapshot path does not exist: $path"
+    fi
+
+    local subvol_info=$(btrfs subvolume show "$path" 2>/dev/null) \
+        || error_and_exit "The provided path is NOT a Btrfs snapshot/subvolume: $path"
+
+    local snap_id=$(echo "$subvol_info" | awk '/Subvolume ID:/ {print $NF}')
+
+    local snap_uuid=$(findmnt -n -o UUID --target "$path")
+
+    if [ -z "$snap_id" ] || [ -z "$snap_uuid" ]; then
+        error_and_exit "Failed to extract Btrfs ID or Disk UUID from: $path"
+    fi
+
+    echo "$snap_id" "$snap_uuid"
+}
+
+resolve_snapper_snapshot_path() {
+    local snap=$1 path=
+
+    case "$snap" in
+    latest)
+        path=$(
+            find /.snapshots -mindepth 2 -maxdepth 2 -type d -name snapshot 2>/dev/null |
+                awk -F/ '$3 ~ /^[0-9]+$/ { print $3, $0 }' |
+                sort -n | tail -1 | cut -d' ' -f2-
+        )
+        [ -n "$path" ] || error_and_exit "Cannot find latest snapper snapshot in /.snapshots"
+        ;;
+    '' | *[!0-9]*)
+        error_and_exit "Invalid snapshot: $snap"
+        ;;
+    *)
+        path="/.snapshots/$snap/snapshot"
+        ;;
+    esac
+
+    [ -d "$path" ] || error_and_exit "Snapshot path does not exist: $path"
+    echo "$path"
+}
+
+prepare_rollback_args() {
+    if [ -n "$snapshot" ]; then
+        [ -z "$snapshot_path" ] || error_and_exit "Use only one of --snapshot and --snapshot-path"
+        snapshot_path=$(resolve_snapper_snapshot_path "$snapshot")
+    fi
+
+    if [ "$rollback_delete_backup" = 1 ] && [ -z "$snapshot_path" ]; then
+        error_and_exit "--rollback-delete-backup needs --snapshot or --snapshot-path"
+    fi
+
+    if [ -n "$snapshot_path" ] && [ "$distro" != rollback ] && [ "$distro" != alpine ]; then
+        error_and_exit "--snapshot and --snapshot-path only support rollback or alpine"
+    fi
+
+    if [ "$distro" = rollback ]; then
+        [ -n "$snapshot_path" ] || error_and_exit "rollback needs --snapshot latest|ID or --snapshot-path PATH"
+        rollback_mode=1
+        distro=alpine
+        releasever=$(get_latest_distro_releasever alpine)
+    fi
+}
+
 is_found_ipv4_netconf() {
     [ -n "$ipv4_mac" ] && [ -n "$ipv4_addr" ] && [ -n "$ipv4_gateway" ]
 }
@@ -3227,6 +3302,24 @@ build_extra_cmdline() {
                 extra_cmdline+=" extra_$key=$value"
         fi
     done
+
+    if [ -n "$snapshot_path" ]; then
+        read -r snap_id snap_uuid <<< $(get_btrfs_snapshot_info "$snapshot_path")
+        info "Snapshot Verified:"
+        echo "  Path: $snapshot_path"
+        echo "  ID:   $snap_id"
+        echo "  UUID: $snap_uuid"
+        if [ "$rollback_delete_backup" = 1 ]; then
+            echo "  Backup: delete old @ after successful rollback"
+        else
+            echo "  Backup: keep old @ as @rollback-backup-*"
+        fi
+        finalos_cmdline+=" finalos_snapshot_id=$snap_id finalos_snapshot_uuid=$snap_uuid"
+        if [ "$rollback_delete_backup" = 1 ]; then
+            finalos_cmdline+=" finalos_rollback_delete_backup=1"
+        fi
+        snapshot_path=""
+    fi
 
     # 指定最终安装系统的 mirrorlist，链接有&，在grub中是特殊字符，所以要加引号
     if [ -n "$finalos_mirrorlist" ]; then
@@ -4423,6 +4516,9 @@ for o in ci installer debug minimal allow-ping force-cn help \
     commit: \
     frpc-conf: frpc-config: \
     target-disk: \
+    snapshot: \
+    snapshot-path: \
+    rollback-delete-backup \
     force-boot-mode: \
     force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
@@ -4538,8 +4634,21 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
-
         shift 2
+        ;;
+    --snapshot-path)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot-path"
+        snapshot_path=$(get_unix_path "$2")
+        shift 2
+        ;;
+    --snapshot)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot"
+        snapshot=$2
+        shift 2
+        ;;
+    --rollback-delete-backup)
+        rollback_delete_backup=1
+        shift
         ;;
     --force-boot-mode)
         if ! { [ "$2" = bios ] || [ "$2" = efi ]; }; then
@@ -4727,6 +4836,8 @@ EOF
         ;;
     esac
 done
+
+prepare_rollback_args
 
 # 检查必须的参数
 verify_os_args
@@ -5031,6 +5142,8 @@ fi
 
 if is_netboot_xyz; then
     echo 'Reboot to start netboot.xyz.'
+elif [ "$rollback_mode" = 1 ]; then
+    echo 'Reboot to start Btrfs snapshot rollback.'
 elif is_alpine_live; then
     echo 'Reboot to start Alpine Live OS.'
 elif is_use_dd; then

@@ -39,6 +39,7 @@ If this helped you, you can buy me a milk tea.
 - [Feature 4. One-click reboot to netboot.xyz](#feature-4-reboot-to--netbootxyz)
 - [Feature 5. One-click reinstallation to Windows](#feature-5-install--windows-iso)
 - [Cancel the reinstallation](#cancel-the-reinstallation)
+- [Btrfs Snapshot Rollback](#btrfs-snapshot-rollback)
 
 ## System Requirements
 
@@ -565,6 +566,34 @@ During the installation process, you might encounter a black screen, and the ser
 
 ```bash
 bash reinstall.sh reset
+```
+
+### Btrfs Snapshot Rollback
+
+Only Btrfs systems whose root subvolume is `@` are supported. Before rollback, the current `@` is renamed to `@rollback-backup-*` and kept by default.
+
+Rollback to the latest Snapper snapshot:
+
+```bash
+bash reinstall.sh rollback --snapshot latest
+```
+
+Rollback to a specific Snapper snapshot number:
+
+```bash
+bash reinstall.sh rollback --snapshot 123
+```
+
+You can also specify the snapshot subvolume path directly:
+
+```bash
+bash reinstall.sh rollback --snapshot-path /.snapshots/123/snapshot
+```
+
+If you do not want to keep the old `@` after a successful rollback, add:
+
+```bash
+--rollback-delete-backup
 ```
 
 ## Parameter Format

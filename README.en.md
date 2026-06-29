@@ -186,6 +186,7 @@ bash reinstall.sh anolis      7|8|23
 - `--ssh-port PORT` Change the SSH port
 - `--web-port PORT` Change the Web port (for log observation during installation only)
 - `--frpc-config PATH` Add frpc for intranet tunneling. Parameter can be local filepath or HTTP URL of the configuration file.
+- `--user-init-url URL` Add a custom VPS initialization script for systemd Linux. It runs on first boot, logs to `journalctl -u reinstall-user-init.service`, and removes its script and service after execution.
 - `--hold 1` Reboot only into install environment, without running installer, only for SSH connect to test network connection.
 - `--hold 2` Prevent reboot after installation completes, allowing SSH login to modify system content; the system is mounted at `/target` for Debian/Kali and `/os` for other distros.
 

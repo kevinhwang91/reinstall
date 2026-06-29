@@ -110,6 +110,7 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--ssh-port    PORT]
                        [--web-port    PORT]
                        [--frpc-config PATH]
+                       [--user-init-url URL]
                        [--snapshot    latest|ID]
                        [--snapshot-path PATH]
                        [--rollback-delete-backup]
@@ -4219,6 +4220,10 @@ This script is outdated, please download reinstall.sh again.
     if [ -n "$frpc_config" ]; then
         cat "$frpc_config" >$initrd_dir/configs/frpc.conf
     fi
+    if [ -n "$user_init_script" ]; then
+        cp "$user_init_script" "$initrd_dir/configs/user-init.sh"
+        chmod 600 "$initrd_dir/configs/user-init.sh"
+    fi
 
     # 收集 cloud-data 打包进 initrd
     if [ -n "$cloud_data" ]; then
@@ -4707,6 +4712,7 @@ for o in ci installer debug minimal allow-ping force-cn help \
     allow-ping: \
     commit: \
     frpc-conf: frpc-config: \
+    user-init-url: \
     target-disk: \
     snapshot: \
     snapshot-path: \
@@ -4826,6 +4832,19 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
+        shift 2
+        ;;
+    --user-init-url)
+        [ -n "$2" ] || error_and_exit "Need value for $1"
+        case "$(to_lower <<<"$2")" in
+        http://* | https://*) ;;
+        *) error_and_exit "Invalid $1 value: $2" ;;
+        esac
+        user_init_script=$tmp/user-init.sh
+        if ! curl -L "$2" -o "$user_init_script"; then
+            error_and_exit "Can't get user init script from $2"
+        fi
+        chmod 600 "$user_init_script"
         shift 2
         ;;
     --ssh)

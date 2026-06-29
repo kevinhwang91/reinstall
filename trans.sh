@@ -2246,6 +2246,42 @@ add_frpc_systemd_service_if_need() {
     fi
 }
 
+add_user_init_systemd_service_if_need() {
+    local os_dir=$1
+    local bash_path
+
+    [ -f /configs/user-init.sh ] || return
+    is_have_cmd_on_disk "$os_dir" systemctl || return
+    is_have_cmd_on_disk "$os_dir" bash || return
+
+    if [ -f "$os_dir/usr/bin/bash" ]; then
+        bash_path=/usr/bin/bash
+    else
+        bash_path=/bin/bash
+    fi
+
+    mkdir -p "$os_dir/usr/local/lib" "$os_dir/etc/systemd/system"
+    cp /configs/user-init.sh "$os_dir/usr/local/lib/reinstall-user-init.sh"
+    chmod 700 "$os_dir/usr/local/lib/reinstall-user-init.sh"
+
+    cat >"$os_dir/etc/systemd/system/reinstall-user-init.service" <<EOF
+[Unit]
+Description=Run user VPS initialization script
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/lib/reinstall-user-init.sh
+
+[Service]
+Type=oneshot
+ExecStart=$bash_path -c '$bash_path /usr/local/lib/reinstall-user-init.sh; status=\$\$?; systemctl disable reinstall-user-init.service || true; rm -f /etc/systemd/system/reinstall-user-init.service /usr/local/lib/reinstall-user-init.sh; systemctl daemon-reload || true; exit \$\$status'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chroot "$os_dir" systemctl enable reinstall-user-init.service
+}
+
 get_fs_of_mount_point() {
     local mount_point=$1
 
@@ -2318,6 +2354,9 @@ basic_init() {
 
     # frpc
     add_frpc_systemd_service_if_need $os_dir
+
+    # 用户自定义 VPS 初始化脚本，首次启动后自动清理
+    add_user_init_systemd_service_if_need $os_dir
 }
 
 install_arch_gentoo_aosc() {

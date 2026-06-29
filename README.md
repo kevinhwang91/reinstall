@@ -91,13 +91,13 @@
 国外服务器：
 
 ```bash
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/kevinhwang91/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
 
 国内服务器：
 
 ```bash
-curl -O https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/kevinhwang91/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
 
 ## 下载（当前系统是 <img width="20" height="20" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows）
@@ -731,6 +731,18 @@ bash reinstall.sh ...
 本分支是在上游 `bin456789/reinstall` 基础上维护的个人修改。`main` 是上游基线，`kevin` 保留功能提交；2026-10-23 核对的基线为 `2252ca7615cd672dc1d9e67c52243db4ac859151`。在功能完整、行为正确的前提下，优先保持相对 `main` 的修改足够小，沿用上游入口和调用链，避免无关重构或格式调整。
 
 以下按功能记录修改意图、执行逻辑、必要性和验证边界，各节随对应功能提交维护。同步上游后应重新核对这些依据；协作规则见 [AGENTS.md](AGENTS.md)。
+
+### 脚本来源与版本一致性
+
+对应提交：`chore(fork): use kevin reinstall source`。
+
+**问题与意图。** 上游入口从 `bin456789/reinstall` 下载安装阶段脚本和资源。如果仅替换本地入口，后续仍下载上游资源，个人分支的功能就不能完整进入安装环境。此修改让入口与配套资源使用同一个个人维护来源。
+
+**执行逻辑。** `reinstall.sh` 的 `confhome` 指向 `kevinhwang91/reinstall/main`，`confhome_cn` 复用该值；中英文 README 的 Linux 下载示例同步指向个人入口。继续使用上游已有的资源下载调用链，不逐个改写安装脚本的下载点，也不改动各发行版的系统镜像地址。
+
+**为何保持这个范围。** 复用上游的来源变量比另建下载机制更小；国内来源统一是为了版本一致，不代表增加镜像加速。Windows 引导下载示例未在此功能中统一迁移，因此不能据此声称所有入口都已切换。`kevin` 是本地开发分支，而默认下载地址仍是个人仓库的 `main`；本地提交或 rebase 不会自动发布到该地址，测试未发布版本应使用匹配提交或受控资源来源。
+
+**验证和维护依据。** 执行 `bash -n reinstall.sh`，并在本轮历史整理后比较重写前后的运行文件。同步上游时核对来源变量、`--commit` 处理和配套脚本版本校验仍一致；语法和差异检查不能证明公网资源已经发布或所有网络位置都能连接。
 
 ## 感谢
 

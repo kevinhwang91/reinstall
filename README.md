@@ -744,6 +744,24 @@ bash reinstall.sh ...
 
 **验证和维护依据。** 执行 `bash -n reinstall.sh`，并在本轮历史整理后比较重写前后的运行文件。同步上游时核对来源变量、`--commit` 处理和配套脚本版本校验仍一致；语法和差异检查不能证明公网资源已经发布或所有网络位置都能连接。
 
+### 根设备和父磁盘识别
+
+对应提交：`fix(core): resolve root disk from mountinfo`。
+
+**问题与意图。** 上游从 `mount` 显示结果取根设备并交给 `lsblk`，但部分系统显示的 `/dev/root` 并不存在。修改仅补全挂载点到真实块设备的解析，不改变后续分区策略，也不猜测第一块磁盘。
+
+**执行逻辑。** `reinstall.sh` 和独立的 `deprecated/resize.sh` 使用同样的两个小函数：
+
+1. `get_mount_block_dev TARGET` 先从 `/proc/mounts` 取来源；路径存在时用 `readlink -f` 返回，保留普通设备、符号链接和 device-mapper 的成功路径。
+2. 来源路径不存在时，从 `/proc/self/mountinfo` 读取该挂载点的 `major:minor`，再用 `lsblk -rpn -o NAME,MAJ:MIN` 对应到真实设备；找不到就失败。
+3. `get_disks_by_block_dev DEV` 用 `lsblk --inverse` 沿父设备查找，按 `TYPE == disk` 取磁盘并去重。指定输出列，避免依赖默认表头或树形绘制。
+
+主脚本的 `find_main_disk` 显式拒绝空结果，后续多磁盘处理沿用原流程；`get_disk_by_part` 也复用父磁盘查询。扩容脚本要求恰好一个父磁盘，零个或多个均退出，避免未经确定就操作磁盘。
+
+**为何保留少量重复。** 旧版扩容脚本是独立入口，直接导入主脚本会触发其入口。保留两份小函数比新增运行时下载依赖更小；改算法时必须核对两份实现。SSH 快照接收复用 `get_mount_block_dev /`，此函数不能混入挂载、格式化或分区操作。
+
+**边界与验证。** 回退要求挂载设备号能由 `lsblk` 对应到块设备，没有新增 overlay、网络根或任意复杂堆叠存储支持。本轮执行 `bash -n reinstall.sh deprecated/resize.sh` 并逐项比较重写前后的函数。现有接收测试使用设备路径替身，不能证明 `/dev/root` 的真实反查；当前没有针对该特殊挂载形式的新虚拟机验收。后续改动应验证有效路径、设备号回退、无结果和多个父磁盘四种情况。
+
 ## 感谢
 
 感谢以下商家提供白嫖机器

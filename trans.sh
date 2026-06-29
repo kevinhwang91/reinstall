@@ -2331,8 +2331,9 @@ install_arch_gentoo_aosc() {
     )
 
     set_locale() {
-        echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' $os_dir/etc/locale.gen
         chroot $os_dir locale-gen
+        echo 'LANG=en_US.UTF-8' > $os_dir/etc/locale.conf
     }
 
     # shellcheck disable=SC2317
@@ -2346,6 +2347,11 @@ install_arch_gentoo_aosc() {
         else
             local alpine_rootfs=$os_dir/alpine
             create_alpine_rootfs_with_arch_install_scripts "$alpine_rootfs" true "$os_dir"
+        fi
+
+        mounted_fs=$(findmnt -n -o FSTYPE --target "$os_dir")
+        if [ "$mounted_fs" != btrfs ]; then
+            error_and_exit "Arch install target $os_dir must be mounted as btrfs, got ${mounted_fs:-unknown}"
         fi
 
         # 为了二次运行时 /etc/pacman.conf 未修改
@@ -2367,7 +2373,8 @@ Include = /etc/pacman.d/mirrorlist
 [extra]
 Include = /etc/pacman.d/mirrorlist
 EOF
-        mkdir -p $alpine_rootfs/etc/pacman.d
+        mkdir -p "$alpine_rootfs/etc/pacman.d"
+        mkdir -p "$os_dir/var/lib/portables" "$os_dir/var/lib/machines"
         # shellcheck disable=SC2016
         case "$(uname -m)" in
         x86_64) dir='$repo/os/$arch' ;;
@@ -2407,7 +2414,7 @@ EOF
         else
             retry 5 chroot "$alpine_rootfs" pacstrap -K "/parent" $pkgs
             killall -q gpg-agent || true
-            umount -R "$alpine_rootfs/parent"
+            ensure_not_mounted "$alpine_rootfs/parent"
             remove_alpine_rootfs "$alpine_rootfs"
         fi
 
@@ -2432,7 +2439,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs snapper
     }
 
     # shellcheck disable=SC2317
@@ -2616,6 +2623,23 @@ EOF
         chroot $os_dir update-initramfs
     }
 
+    create_arch_snapper_config() {
+        local os_dir=$1
+        local snapper_cfg="$os_dir/etc/snapper/configs/root"
+
+        [ "$distro" = arch ] || return
+        [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ] || return
+        [ -f "$snapper_cfg" ] && return
+
+        # 安装 chroot 里没有 system bus，需直接以 no-dbus 模式创建配置
+        chroot "$os_dir" snapper --no-dbus -c root create-config /
+
+        # create-config 在正式 systemd 环境中可能自动启用 timeline timer，这里关掉
+        if chroot "$os_dir" systemctl is-enabled snapper-timeline.timer >/dev/null 2>&1; then
+            chroot "$os_dir" systemctl disable snapper-timeline.timer
+        fi
+    }
+
     local os_dir=/os
 
     # 挂载分区
@@ -2700,7 +2724,21 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if grep -q '^[#[:space:]]*GRUB_TIMEOUT=' "$file"; then
+        sed -i 's/^[#[:space:]]*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' $file
+    else
+        echo 'GRUB_TIMEOUT=1' >>$file
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
+
+    if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
+        btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+        mkdir -p "$os_dir/swap"
+        mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
+    fi
+
+    create_arch_snapper_config "$os_dir"
 
     # fstab
     # fstab 可不写 efi 条目， systemd automount 会自动挂载
@@ -2709,9 +2747,13 @@ EOF
     create_alpine_rootfs_with_arch_install_scripts "$alpine_rootfs" true "$os_dir"
     # genfstab 会用到 findmnt 等工具
     retry 5 chroot "$alpine_rootfs" apk add util-linux
-    chroot "$alpine_rootfs" genfstab -U /parent | sed '/swap/d' >>$os_dir/etc/fstab
+    chroot "$alpine_rootfs" genfstab -U /parent | awk '$3 != "swap"' >>"$os_dir/etc/fstab"
+    if [ -d "$os_dir/swap" ] && ! grep -q '^[#[:space:]]*/swap/swapfile[[:space:]]\+none[[:space:]]\+swap[[:space:]]' "$os_dir/etc/fstab"; then
+        echo '# /swap/swapfile none swap defaults,nofail,pri=10 0 0' >>"$os_dir/etc/fstab"
+    fi
     umount -R "$alpine_rootfs/parent"
     remove_alpine_rootfs "$alpine_rootfs"
+    umount "$os_dir/swap" 2>/dev/null || true
 
     # 删除 resolv.conf，不然 systemd-resolved 无法创建软链接
     rm_resolv_conf $os_dir
@@ -2909,12 +2951,37 @@ xda() {
     fi
 }
 
+mkfs_arch_btrfs() {
+    local part_dev=$1
+
+    wipefs -a "$part_dev"
+    mkfs.btrfs -f -L os "$part_dev"
+    mkdir -p /mnt
+    mount "$part_dev" /mnt
+    btrfs subvolume create /mnt/@
+    btrfs subvolume create /mnt/@swap
+    umount /mnt
+}
+
+mkfs_linux_os_part() {
+    local part_dev=$1
+
+    if [ "$distro" = arch ]; then
+        mkfs_arch_btrfs "$part_dev"
+    else
+        mkfs.ext4 -F $ext4_opts "$part_dev"
+    fi
+}
+
 create_part() {
     # 除了 dd 都会用到
     info "Create Part"
 
     # 分区工具
     apk add parted e2fsprogs
+    if [ "$distro" = arch ]; then
+        apk add btrfs-progs
+    fi
     if is_efi; then
         apk add dosfstools
     fi
@@ -3112,37 +3179,53 @@ create_part() {
         # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
         # 而且 alpine 的 extlinux 不兼容 64bit ext4
         [ "$distro" = alpine ] && ext4_opts="-O ^64bit" || ext4_opts=
+        os_part_type=ext4
+        [ "$distro" = arch ] && os_part_type=btrfs
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 101MiB \
-                mkpart '" "' ext4 101MiB 100% \
+                mkpart '" "' $os_part_type 101MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.fat "/dev/$(xda 1)"                #1 efi
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            mkfs.fat "/dev/$(xda 1)"          #1 efi
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB 2MiB \
-                mkpart '" "' ext4 2MiB 100% \
+                mkpart '" "' $os_part_type 2MiB 100% \
                 set 1 bios_grub on
             update_part
 
-            echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            echo                              #1 bios_boot
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         else
-            # bios
-            parted /dev/$xda -s -- \
-                mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
-                set 1 boot on
-            update_part
-
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            if [ "$distro" = alpine ]; then
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary ext4 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            elif [ "$distro" = arch ]; then
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary btrfs 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs_arch_btrfs "/dev/$(xda 1)"
+            else
+                parted /dev/$xda -s -- \
+                    mklabel msdos \
+                    mkpart primary ext4 1MiB 100% \
+                    set 1 boot on
+                update_part
+                mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            fi
         fi
     else
         # 安装红帽系或ubuntu
@@ -6149,15 +6232,26 @@ mount_part_basic_layout() {
     local os_dir=$1
     local efi_dir=$2
 
+    ensure_not_mounted "$os_dir"
+
     if is_efi || is_xda_gt_2t; then
         os_part_num=2
     else
         os_part_num=1
     fi
-
+    part_dev="/dev/$(xda $os_part_num)"
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 "/dev/$(xda $os_part_num)" $os_dir
+    if [ "$distro" = arch ]; then
+        mount -t btrfs -o noatime,compress=zstd,subvol=@ $part_dev $os_dir
+    else
+        fs_type=$(lsblk -rn -o FSTYPE "$part_dev")
+        if [ "$fs_type" = btrfs ]; then
+            mount -t btrfs -o noatime,compress=zstd,subvol=@ $part_dev $os_dir
+        else
+            mount -t ext4 $part_dev $os_dir
+        fi
+    fi
 
     # 挂载 efi 分区
     if is_efi; then
@@ -8428,7 +8522,12 @@ trans() {
         alpine)
             install_alpine
             ;;
-        arch | gentoo | aosc)
+        arch)
+            modprobe btrfs
+            create_part
+            install_arch_gentoo_aosc
+            ;;
+        gentoo | aosc)
             create_part
             install_arch_gentoo_aosc
             ;;

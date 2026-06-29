@@ -2773,6 +2773,8 @@ EOF
 
     if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
         btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
+        mkdir -p "$os_dir/.snapshots"
+        mount -t btrfs -o defaults,noatime,compress=zstd,subvol=@snapshots "$btrfs_part" "$os_dir/.snapshots"
         mkdir -p "$os_dir/swap"
         mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
     fi
@@ -2792,6 +2794,7 @@ EOF
     fi
     umount -R "$alpine_rootfs/parent"
     remove_alpine_rootfs "$alpine_rootfs"
+    umount "$os_dir/.snapshots" 2>/dev/null || true
     umount "$os_dir/swap" 2>/dev/null || true
 
     # 删除 resolv.conf，不然 systemd-resolved 无法创建软链接
@@ -2998,6 +3001,7 @@ mkfs_arch_btrfs() {
     mkdir -p /mnt
     mount "$part_dev" /mnt
     btrfs subvolume create /mnt/@
+    btrfs subvolume create /mnt/@snapshots
     btrfs subvolume create /mnt/@swap
     umount /mnt
 }

@@ -5193,7 +5193,7 @@ if is_need_boot_vmlinuz; then
             # 获取当前系统根目录在 btrfs 中的绝对路径
             if is_os_in_btrfs; then
                 # btrfs subvolume show /
-                # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
+                # 输出可能是 / 或 root 或 @snapshots/1/snapshot
                 dir=$(btrfs subvolume show / | head -1)
                 if ! [ "$dir" = / ]; then
                     dir="/$dir/"

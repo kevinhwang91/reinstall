@@ -89,13 +89,13 @@ The system requirements for the target system are as follows:
 For server outside China:
 
 ```bash
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/kevinhwang91/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
 
 For server inside China:
 
 ```bash
-curl -O https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh || wget -O ${_##*/} $_
+curl -O https://raw.githubusercontent.com/kevinhwang91/reinstall/main/reinstall.sh || wget -O ${_##*/} $_
 ```
 
 ## Download (Current system is <img width="20" height="20" src="https://blogs.windows.com/wp-content/uploads/prod/2022/09/cropped-Windows11IconTransparent512-32x32.png" /> Windows)

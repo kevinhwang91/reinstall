@@ -2665,17 +2665,35 @@ EOF
     create_arch_snapper_config() {
         local os_dir=$1
         local snapper_cfg="$os_dir/etc/snapper/configs/root"
+        local btrfs_part snapshots_top="$os_dir/.btrfs-root"
 
         [ "$distro" = arch ] || return
         [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ] || return
-        [ -f "$snapper_cfg" ] && return
+        btrfs_part=$(findmnt -no SOURCE "$os_dir" | sed 's/\[.*\]//')
+        [ -n "$btrfs_part" ] || return
 
-        # 安装 chroot 里没有 system bus，需直接以 no-dbus 模式创建配置
-        chroot "$os_dir" snapper --no-dbus -c root create-config /
+        if ! [ -f "$snapper_cfg" ]; then
+            # 安装 chroot 里没有 system bus，需直接以 no-dbus 模式创建配置
+            chroot "$os_dir" snapper --no-dbus -c root create-config /
+        fi
 
         # create-config 在正式 systemd 环境中可能自动启用 timeline timer，这里关掉
         if chroot "$os_dir" systemctl is-enabled snapper-timeline.timer >/dev/null 2>&1; then
             chroot "$os_dir" systemctl disable snapper-timeline.timer
+        fi
+
+        mkdir -p "$snapshots_top"
+        mount -t btrfs -o subvolid=5 "$btrfs_part" "$snapshots_top"
+        if [ -d "$snapshots_top/@/.snapshots" ] && ! [ -e "$snapshots_top/@snapshots" ]; then
+            mv "$snapshots_top/@/.snapshots" "$snapshots_top/@snapshots"
+            mkdir -p "$snapshots_top/@/.snapshots"
+        fi
+        umount "$snapshots_top"
+        rmdir "$snapshots_top" 2>/dev/null || true
+
+        mkdir -p "$os_dir/.snapshots"
+        if ! findmnt "$os_dir/.snapshots" >/dev/null 2>&1; then
+            mount -t btrfs -o defaults,noatime,compress=zstd,subvol=@snapshots "$btrfs_part" "$os_dir/.snapshots"
         fi
     }
 
@@ -2773,8 +2791,6 @@ EOF
 
     if [ "$(findmnt -no FSTYPE --target "$os_dir")" = "btrfs" ]; then
         btrfs_part=$(findmnt -no SOURCE $os_dir | sed 's/\[.*\]//')
-        mkdir -p "$os_dir/.snapshots"
-        mount -t btrfs -o defaults,noatime,compress=zstd,subvol=@snapshots "$btrfs_part" "$os_dir/.snapshots"
         mkdir -p "$os_dir/swap"
         mount -t btrfs -o defaults,noatime,subvol=@swap "$btrfs_part" "$os_dir/swap"
     fi
@@ -3001,7 +3017,6 @@ mkfs_arch_btrfs() {
     mkdir -p /mnt
     mount "$part_dev" /mnt
     btrfs subvolume create /mnt/@
-    btrfs subvolume create /mnt/@snapshots
     btrfs subvolume create /mnt/@swap
     umount /mnt
 }

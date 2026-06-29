@@ -99,6 +99,8 @@ Usage: $reinstall_____ anolis      7|8|23
                        windows     --image-name="windows xxx yyy" --lang=xx-yy
                        windows     --image-name="windows xxx yyy" --iso="http://xxx.com/xxx.iso"
                        netboot.xyz
+                       rollback    --snapshot latest|ID|--snapshot-path PATH
+                       rollback    --ssh USER@HOST:/PATH
                        reset
 
        Options:        For Linux/Windows:
@@ -108,6 +110,9 @@ Usage: $reinstall_____ anolis      7|8|23
                        [--ssh-port    PORT]
                        [--web-port    PORT]
                        [--frpc-config PATH]
+                       [--snapshot    latest|ID]
+                       [--snapshot-path PATH]
+                       [--rollback-delete-backup]
 
                        For Windows Only:
                        [--allow-ping]
@@ -1976,6 +1981,7 @@ verify_os_name() {
         'windows' \
         'dd' \
         'netboot.xyz' \
+        'rollback' \
         'reset'; do
         read -r ds vers <<<"$os"
         vers_=${vers//\./\\\.}
@@ -2106,6 +2112,13 @@ install_pkg() {
             case "$pkg_mgr" in
             apt-get) pkg="bsdmainutils" ;;
             *) pkg="util-linux" ;;
+            esac
+            ;;
+        ssh)
+            case "$pkg_mgr" in
+            apt-get | apk) pkg="openssh-client" ;;
+            dnf | yum) pkg="openssh-clients" ;;
+            *) pkg="openssh" ;;
             esac
             ;;
         unsquashfs)
@@ -2672,6 +2685,145 @@ find_main_disk() {
     if ! grep -Eix '[0-9a-f]{8}' <<<"$main_disk" &&
         ! grep -Eix '[0-9a-f-]{36}' <<<"$main_disk"; then
         error_and_exit "Disk ID is invalid: $main_disk"
+    fi
+}
+
+get_btrfs_snapshot_info() {
+    if ! is_have_cmd btrfs || ! is_have_cmd findmnt; then
+        install_pkg btrfs-progs util-linux >&2
+    fi
+
+    local path=$(readlink -f "$1")
+    if [ ! -e "$path" ]; then
+        error_and_exit "Snapshot path does not exist: $path"
+    fi
+
+    local subvol_info=$(btrfs subvolume show "$path" 2>/dev/null) \
+        || error_and_exit "The provided path is NOT a Btrfs snapshot/subvolume: $path"
+
+    local snap_id=$(echo "$subvol_info" | awk '/Subvolume ID:/ {print $NF}')
+
+    local snap_uuid=$(findmnt -n -o UUID --target "$path")
+
+    if [ -z "$snap_id" ] || [ -z "$snap_uuid" ]; then
+        error_and_exit "Failed to extract Btrfs ID or Disk UUID from: $path"
+    fi
+
+    echo "$snap_id" "$snap_uuid"
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+resolve_snapper_snapshot_path() {
+    local snap=$1 path=
+
+    case "$snap" in
+    latest)
+        path=$(
+            find /.snapshots -mindepth 2 -maxdepth 2 -type d -name snapshot 2>/dev/null |
+                awk -F/ '$3 ~ /^[0-9]+$/ { print $3, $0 }' |
+                sort -n | tail -1 | cut -d' ' -f2-
+        )
+        [ -n "$path" ] || error_and_exit "Cannot find latest snapper snapshot in /.snapshots"
+        ;;
+    '' | *[!0-9]*)
+        error_and_exit "Invalid snapshot: $snap"
+        ;;
+    *)
+        path="/.snapshots/$snap/snapshot"
+        ;;
+    esac
+
+    [ -d "$path" ] || error_and_exit "Snapshot path does not exist: $path"
+    echo "$path"
+}
+
+receive_ssh_btrfs_snapshot() {
+    [ -n "$snapshot_source" ] || error_and_exit "rollback --ssh needs USER@HOST:/PATH"
+    [ -z "$snapshot" ] || error_and_exit "Use only one of --snapshot and rollback --ssh"
+    [ -z "$snapshot_path" ] || error_and_exit "Use only one of --snapshot-path and rollback --ssh"
+    is_in_windows && error_and_exit "rollback --ssh only supports Linux source systems"
+    is_os_in_btrfs || error_and_exit "rollback --ssh needs current system root on Btrfs"
+
+    case "$snapshot_source" in
+    *:/*) ;;
+    *) error_and_exit "Invalid rollback --ssh source, expected USER@HOST:/snapshot/path" ;;
+    esac
+
+    local source_host=${snapshot_source%%:*} remote_path=${snapshot_source#*:}
+    remote_path=${remote_path%/}
+    [ -n "$source_host" ] || error_and_exit "Missing host in rollback --ssh source"
+    [ -n "$remote_path" ] || error_and_exit "Missing path in rollback --ssh source"
+
+    install_pkg btrfs-progs findmnt lsblk
+    if ! is_have_cmd ssh; then
+        install_pkg ssh
+    fi
+    is_have_cmd ssh || error_and_exit "ssh command not found; please install OpenSSH client"
+
+    local btrfs_dev recv_root recv_dir recv_name received_path remote_path_q remote_btrfs pipefail_state
+    if ! btrfs_dev=$(get_mount_block_dev /); then
+        error_and_exit "Could not find Btrfs device for current root"
+    fi
+
+    recv_root=$tmp/reinstall-btrfs-root
+    recv_name="rollback-from-ssh-$(date +%Y%m%d-%H%M%S)-$$"
+    recv_dir="$recv_root/.reinstall-rollback-receive-$recv_name"
+
+    mkdir -p "$recv_root"
+    if ! grep -q " $recv_root " /proc/mounts; then
+        mount -t btrfs -o subvolid=5 "$btrfs_dev" "$recv_root"
+    fi
+    mkdir -p "$recv_dir"
+
+    remote_path_q=$(shell_quote "$remote_path")
+    remote_btrfs="btrfs property set -ts $remote_path_q ro true && btrfs send $remote_path_q"
+
+    info "Receive Btrfs snapshot from $source_host:$remote_path"
+    pipefail_state=$(set +o | grep pipefail)
+    set -o pipefail
+    if ! ssh "$source_host" "$remote_btrfs" | btrfs receive "$recv_dir"; then
+        eval "$pipefail_state"
+        error_and_exit "Failed to receive Btrfs snapshot from $snapshot_source"
+    fi
+    eval "$pipefail_state"
+
+    received_path="$recv_dir/${remote_path##*/}"
+    if [ ! -d "$received_path" ]; then
+        received_path=$(find "$recv_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
+    fi
+    [ -n "$received_path" ] && [ -d "$received_path" ] || error_and_exit "Received snapshot not found in $recv_dir"
+
+    snapshot_path=$received_path
+    distro=rollback
+}
+
+prepare_rollback_args() {
+    if [ -n "$snapshot_source" ]; then
+        [ "$distro" = rollback ] || error_and_exit "rollback --ssh only supports rollback"
+        receive_ssh_btrfs_snapshot
+    fi
+
+    if [ -n "$snapshot" ]; then
+        [ -z "$snapshot_path" ] || error_and_exit "Use only one of --snapshot and --snapshot-path"
+        snapshot_path=$(resolve_snapper_snapshot_path "$snapshot")
+    fi
+
+    if [ "$rollback_delete_backup" = 1 ] && [ -z "$snapshot_path" ]; then
+        error_and_exit "--rollback-delete-backup needs --snapshot or --snapshot-path"
+    fi
+
+    if [ -n "$snapshot_path" ] && [ "$distro" != rollback ] && [ "$distro" != alpine ]; then
+        error_and_exit "--snapshot and --snapshot-path only support rollback or alpine"
+    fi
+
+    if [ "$distro" = rollback ]; then
+        [ -n "$snapshot_path" ] || error_and_exit "rollback needs --snapshot latest|ID or --snapshot-path PATH"
+        rollback_mode=1
+        distro=alpine
+        releasever=$(get_latest_distro_releasever alpine)
     fi
 }
 
@@ -3304,6 +3456,24 @@ build_extra_cmdline() {
                 extra_cmdline+=" extra_$key=$value"
         fi
     done
+
+    if [ -n "$snapshot_path" ]; then
+        read -r snap_id snap_uuid <<< $(get_btrfs_snapshot_info "$snapshot_path")
+        info "Snapshot Verified:"
+        echo "  Path: $snapshot_path"
+        echo "  ID:   $snap_id"
+        echo "  UUID: $snap_uuid"
+        if [ "$rollback_delete_backup" = 1 ]; then
+            echo "  Backup: delete old @ after successful rollback"
+        else
+            echo "  Backup: keep old @ as @rollback-backup-*"
+        fi
+        finalos_cmdline+=" finalos_snapshot_id=$snap_id finalos_snapshot_uuid=$snap_uuid"
+        if [ "$rollback_delete_backup" = 1 ]; then
+            finalos_cmdline+=" finalos_rollback_delete_backup=1"
+        fi
+        snapshot_path=""
+    fi
 
     # 指定最终安装系统的 mirrorlist，链接有&，在grub中是特殊字符，所以要加引号
     if [ -n "$finalos_mirrorlist" ]; then
@@ -4503,7 +4673,20 @@ if is_secure_boot_enabled; then
     error_and_exit "Please disable secure boot first."
 fi
 
-# 整理参数
+# 整理参数，兼容旧的 rollback -ssh 写法
+args=()
+while [ $# -gt 0 ]; do
+    if [ "$1" = rollback ] && [ "${2:-}" = -ssh ]; then
+        [ -n "${3:-}" ] || error_and_exit "rollback --ssh needs USER@HOST:/PATH"
+        args+=("$1" --ssh "$3")
+        shift 3
+    else
+        args+=("$1")
+        shift
+    fi
+done
+set -- "${args[@]}"
+
 long_opts=
 for o in ci installer debug minimal allow-ping force-cn help \
     add-driver: \
@@ -4516,6 +4699,7 @@ for o in ci installer debug minimal allow-ping force-cn help \
     lang: \
     user: username: \
     passwd: password: \
+    ssh: \
     ssh-port: \
     ssh-key: public-key: \
     rdp-port: \
@@ -4524,6 +4708,9 @@ for o in ci installer debug minimal allow-ping force-cn help \
     commit: \
     frpc-conf: frpc-config: \
     target-disk: \
+    snapshot: \
+    snapshot-path: \
+    rollback-delete-backup \
     force-boot-mode: \
     force-old-windows-setup:; do
     [ -n "$long_opts" ] && long_opts+=,
@@ -4639,8 +4826,26 @@ while true; do
 
         # 转为绝对路径
         frpc_config=$(readlink -f "$frpc_config")
-
         shift 2
+        ;;
+    --ssh)
+        [ -n "$2" ] || error_and_exit "Need value for --ssh"
+        snapshot_source=$2
+        shift 2
+        ;;
+    --snapshot-path)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot-path"
+        snapshot_path=$(get_unix_path "$2")
+        shift 2
+        ;;
+    --snapshot)
+        [ -n "$2" ] || error_and_exit "Need value for --snapshot"
+        snapshot=$2
+        shift 2
+        ;;
+    --rollback-delete-backup)
+        rollback_delete_backup=1
+        shift
         ;;
     --force-boot-mode)
         if ! { [ "$2" = bios ] || [ "$2" = efi ]; }; then
@@ -4826,6 +5031,8 @@ EOF
         ;;
     esac
 done
+
+prepare_rollback_args
 
 # 检查必须的参数
 verify_os_args
@@ -5119,6 +5326,15 @@ web_port=${web_port:-80}
 
 if [ "$distro" = netboot.xyz ]; then
     :
+elif [ "$rollback_mode" = 1 ]; then
+    info "Btrfs Snapshot Rollback"
+    echo "The selected Btrfs snapshot rollback will start after reboot."
+    if [ "$rollback_delete_backup" = 1 ]; then
+        echo "Backup Policy: delete previous @ after a successful rollback"
+    else
+        echo "Backup Policy: keep previous @ as @rollback-backup-*"
+    fi
+
 elif [ "$distro" = alpine ] && [ "$hold" = 1 ]; then
     info "Alpine Live OS"
     echo "Username: $username"
@@ -5229,6 +5445,14 @@ elif [ "$distro" = alpine ] && [ "$hold" = 1 ]; then
     echo
     echo 'Reboot to start Alpine Live OS.'
     echo "Or run \"$reinstall_____ reset\" now to clear this boot entry."
+    echo
+
+elif [ "$rollback_mode" = 1 ]; then
+    echo '重启后开始 Btrfs 快照回滚。'
+    echo "或者现在运行 \"$reinstall_____ reset\" 以取消回滚。"
+    echo
+    echo 'Reboot to start the Btrfs snapshot rollback.'
+    echo "Or run \"$reinstall_____ reset\" now to cancel the rollback."
     echo
 else
     warn false '警告：重装会清除主硬盘的所有数据，包括所有分区！'

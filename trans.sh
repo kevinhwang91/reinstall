@@ -15,6 +15,7 @@ SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
 TRUE=0
 FALSE=1
 EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+cleanup_on_abort_enabled=0
 
 error() {
     color='\e[31m'
@@ -596,6 +597,55 @@ umount_all() {
     fi
 }
 
+release_mount_tree() {
+    target=$1
+
+    if ! findmnt "$target" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    umount -R "$target" 2>/dev/null || true
+
+    if findmnt "$target" >/dev/null 2>&1 && is_have_cmd fuser; then
+        fuser -km "$target" >/dev/null 2>&1 || true
+        sleep 1
+        umount -R "$target" 2>/dev/null || true
+    fi
+
+    ! findmnt "$target" >/dev/null 2>&1
+}
+
+cleanup_on_abort() {
+    set +e
+    swapoff -a
+    umount_all
+    release_mount_tree /os || true
+    release_mount_tree /nbd || true
+    set -e
+}
+
+trap_exit() {
+    ret=$?
+
+    if [ "$cleanup_on_abort_enabled" = 1 ] && [ "$ret" -ne 0 ]; then
+        cleanup_on_abort
+    fi
+
+    return "$ret"
+}
+
+trap_signal() {
+    exit "$1"
+}
+
+ensure_not_mounted() {
+    target=$1
+
+    if ! release_mount_tree "$target"; then
+        error_and_exit "Failed to unmount $target"
+    fi
+}
+
 # 可能脚本不是首次运行，先清理之前的残留
 clear_previous() {
     if is_have_cmd vgchange; then
@@ -609,8 +659,9 @@ clear_previous() {
     # 在 aria2c 下载时手动中止脚本，aria2c 还会在后台下载
     killall -q gpg-agent aria2c || true
     rc-service -q --ifexists --ifstarted nix-daemon stop
-    swapoff -a
-    umount_all
+    cleanup_on_abort
+    ensure_not_mounted /os
+    ensure_not_mounted /nbd
 
     # 以下情况 umount -R /1 会提示 busy
     # mount /file1 /1
@@ -8289,6 +8340,7 @@ EOF
 
 trans() {
     info "start trans"
+    cleanup_on_abort_enabled=1
 
     mod_motd
 
@@ -8406,6 +8458,7 @@ trans() {
         add_default_efi_to_nvram
     fi
 
+    cleanup_on_abort_enabled=0
     info 'done'
     # 让 web 输出全部内容
     sleep 5
@@ -8579,6 +8632,9 @@ if ! [ "$(readlink -f "$0")" = /trans.sh ]; then
     cp -f "$0" /trans.sh
 fi
 trap 'trap_err $LINENO $?' ERR
+trap trap_exit EXIT
+trap 'trap_signal 130' INT
+trap 'trap_signal 143' TERM
 
 # 删除本脚本，不然会被复制到新系统
 rm -f /etc/local.d/trans.start

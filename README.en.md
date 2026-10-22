@@ -318,6 +318,25 @@ bash reinstall.sh alpine --hold 1
 - `--ssh-port PORT` Change SSH port
 - `--frpc-config PATH` Add frpc for intranet tunneling. Parameter can be local filepath or HTTP URL of the configuration file.
 
+#### Btrfs snapshot recovery
+
+```bash
+bash reinstall.sh rollback --snapshot latest
+bash reinstall.sh rollback --ssh root@backup-host:/.snapshots/123/snapshot
+```
+
+Recovery compares the current system's network configuration with the snapshot before reboot. Differences are replaced with the current VPS configuration, preserving MAC bindings, DHCP/SLAAC, static addresses, routes, DNS and MTU. Whole-line comments, blank lines and trailing whitespace are ignored; DHCP leases are not copied. An initial boot service matches interface names to the current MAC.
+
+Recovery across disks updates the root partition UUID and keeps the target system's EFI device from `fstab` for matching mount points (`/efi` or `/boot/efi`), avoiding references to the snapshot source's EFI partition.
+
+Remote snapshots are stored directly at `@snapshots/remote-NAME-TIMESTAMP-PID`, accessible at `/.snapshots/remote-*` after boot. Each transfer receives into a temporary directory, creates a read-only snapshot at the final path, and deletes the received subvolume and temporary directory, avoiding collisions with existing local snapshots. These entries are separate from Snapper's numbered history. On legacy installations, snapshots are stored in the existing nested `.snapshots` and moved to the top level with its history during recovery.
+
+If the restored system has a Snapper `root` configuration, recovery reuses the target disk's top-level `@snapshots` and updates `fstab` to mount it at `/.snapshots`. Local snapshot history is independent of `@` and survives rollback or deletion of the previous root. If `@snapshots` is absent, the legacy `@/.snapshots` subvolume and its complete history are moved to the top level; an empty subvolume is created only when neither exists. A nonempty candidate mount directory or a subvolume preparation failure stops recovery. A failed migration or root switch restores the original layout.
+
+Supported systemd systems must use the same network backend: networkd, Netplan, NetworkManager (Ethernet profiles), or ifupdown. Different backends, multiple public uplinks and complex bridge/bond/VLAN topologies stop during preparation. The current root filesystem must be Btrfs. Network adaptation finishes in a candidate subvolume before switching `@`; the previous root subvolume is retained in `@snapshots/rollback-backup-*`, accessible at `/.snapshots/rollback-backup-*` after boot. These backups are separate from Snapper's numbered snapshots. `--rollback-delete-backup` deletes only this rollback's previous root after the switch, retaining other snapshots and backups, without verifying SSH access to the restored system.
+
+Developer checks: `bash tests/rollback.sh`, `bash tests/rollback-network.sh` and `bash tests/rollback-ssh.sh`. The first two also support BusyBox ash through `TEST_BUSYBOX`. `bash tests/btrfs-layout.sh` checks real Btrfs and Snapper on temporary loop devices, requires root or passwordless sudo and the relevant tools, and cleans up afterward. See the [storage layout acceptance record](tests/btrfs-layout.md). Actual recovery, networking and external SSH access require separate validation.
+
 ### Feature 4: Reboot to <img width="16" height="16" src="https://netboot.xyz/img/favicon.ico" /> netboot.xyz
 
 - Can manually install [more systems](https://github.com/netbootxyz/netboot.xyz?tab=readme-ov-file#what-operating-systems-are-currently-available-on-netbootxyz) using vendor backend VNC.

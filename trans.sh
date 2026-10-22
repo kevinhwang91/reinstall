@@ -10,7 +10,7 @@ set -eE
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 # shellcheck disable=SC2034
-SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0005
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0006
 
 TRUE=0
 FALSE=1
@@ -8909,6 +8909,115 @@ trans() {
     sleep 5
 }
 
+rollback_btrfs_from_snapshot() {
+    local mnt=${1:-/mnt} network_config=${2:-/configs/rollback-network}
+    local target_dev rel_path src_path restored_path backup_path= old_uuid file migrate_snapshots=0
+    local suffix=$(date +%Y%m%d-%H%M%S)-$$
+
+    echo "[rollback] Restore snapshot $snapshot_id on UUID $snapshot_uuid"
+    apk add lsblk btrfs-progs util-linux || return 1
+    modprobe btrfs || return 1
+    target_dev=$(blkid -U "$snapshot_uuid") || return 1
+    [ -n "$target_dev" ] || return 1
+    mkdir -p "$mnt" || return 1
+    mount -t btrfs -o subvolid=5 "$target_dev" "$mnt" || return 1
+    rel_path=$(btrfs inspect-internal subvolid-resolve "$snapshot_id" "$mnt") || return 1
+    src_path="$mnt/${rel_path#/}"
+    [ -d "$src_path" ] || return 1
+
+    restored_path="$mnt/@rollback-restore-$suffix"
+    btrfs subvolume snapshot "$src_path" "$restored_path" || return 1
+
+    # SSH 接收的快照可能来自另一块磁盘，同步根分区和引导配置中的 UUID。
+    if [ -f "$restored_path/etc/fstab" ]; then
+        old_uuid=$(awk '$2 == "/" && $1 ~ /^UUID=/ { sub(/^UUID=/, "", $1); print $1; exit }' "$restored_path/etc/fstab") || return 1
+        if [ -n "$old_uuid" ] && [ "$old_uuid" != "$snapshot_uuid" ]; then
+            for file in \
+                "$restored_path/etc/fstab" \
+                "$restored_path/boot/grub/grub.cfg" \
+                "$restored_path/boot/grub2/grub.cfg" \
+                "$restored_path/boot/loader/entries/"*.conf \
+                "$restored_path/etc/default/grub" \
+                "$restored_path/etc/default/grub.d/"*.cfg \
+                "$restored_path/etc/kernel/cmdline" \
+                "$restored_path/etc/kernel/cmdline.d/"*.conf \
+                "$restored_path/boot/efi/EFI/"*/grub.cfg \
+                "$restored_path/efi/EFI/"*/grub.cfg; do
+                [ -f "$file" ] || continue
+                sed -i "s|$old_uuid|$snapshot_uuid|g" "$file" || return 1
+            done
+        fi
+        # EFI 分区不在根快照中，沿用当前目标系统的挂载设备。
+        if [ -f "$mnt/@/etc/fstab" ]; then
+            awk '
+                FILENAME == ARGV[1] {
+                    if ($3 == "vfat" && ($2 == "/efi" || $2 == "/boot/efi")) efi[$2] = $1
+                    next
+                }
+                $3 == "vfat" && $2 in efi { $1 = efi[$2] }
+                { print }
+            ' "$mnt/@/etc/fstab" "$restored_path/etc/fstab" >"$restored_path/etc/fstab.tmp" &&
+                mv "$restored_path/etc/fstab.tmp" "$restored_path/etc/fstab" || return 1
+        fi
+    fi
+
+    # 快照历史和旧根备份统一保存在目标磁盘的顶层 @snapshots。
+    if [ -e "$mnt/@snapshots" ]; then
+        btrfs subvolume show "$mnt/@snapshots" >/dev/null 2>&1 || return 1
+    elif btrfs subvolume show "$mnt/@/.snapshots" >/dev/null 2>&1; then
+        # 旧版嵌套布局在准备完成后迁移，保留整个快照历史。
+        migrate_snapshots=1
+    else
+        btrfs subvolume create "$mnt/@snapshots" || return 1
+        chmod 750 "$mnt/@snapshots" || return 1
+    fi
+    if [ -f "$restored_path/etc/snapper/configs/root" ]; then
+        [ ! -L "$restored_path/.snapshots" ] || return 1
+        mkdir -p "$restored_path/.snapshots" || return 1
+        [ -z "$(ls -A "$restored_path/.snapshots")" ] || return 1
+        awk '$2 != "/.snapshots" { print }' "$restored_path/etc/fstab" >"$restored_path/etc/fstab.tmp" || return 1
+        printf 'UUID=%s /.snapshots btrfs noatime,subvol=/@snapshots 0 0\n' "$snapshot_uuid" >>"$restored_path/etc/fstab.tmp" || return 1
+        mv "$restored_path/etc/fstab.tmp" "$restored_path/etc/fstab" || return 1
+    fi
+
+    if [ ! -f "$network_config/helper.sh" ] ||
+        ! ash "$network_config/helper.sh" restore "$network_config" "$restored_path"; then
+        echo "[rollback] Network adaptation failed; original system kept. Candidate: $restored_path"
+        return 1
+    fi
+
+    # 所有准备完成后才切换 @，失败时保留原系统。
+    if [ "$migrate_snapshots" = 1 ]; then
+        mv "$mnt/@/.snapshots" "$mnt/@snapshots" || return 1
+    fi
+    if [ -d "$mnt/@" ]; then
+        backup_path="$mnt/@snapshots/rollback-backup-$suffix"
+        if ! mv "$mnt/@" "$backup_path"; then
+            if [ "$migrate_snapshots" = 1 ]; then
+                mv "$mnt/@snapshots" "$mnt/@/.snapshots" || true
+            fi
+            return 1
+        fi
+    fi
+    if ! mv "$restored_path" "$mnt/@"; then
+        if [ -n "$backup_path" ]; then
+            mv "$backup_path" "$mnt/@" || true
+        fi
+        if [ "$migrate_snapshots" = 1 ]; then
+            mv "$mnt/@snapshots" "$mnt/@/.snapshots" || true
+        fi
+        return 1
+    fi
+    if [ -n "$backup_path" ]; then
+        if [ "$rollback_delete_backup" = 1 ]; then
+            btrfs subvolume delete "$backup_path" || return 1
+        else
+            echo "[rollback] Backup kept at: $backup_path"
+        fi
+    fi
+    echo '[rollback] Success!'
+}
+
 # 脚本入口
 # debian initrd 会寻找 main
 # 并调用本文件的 create_ifupdown_config 方法
@@ -8989,6 +9098,22 @@ if ls /configs/frpc.* >/dev/null 2>&1 && ! pidof frpc >/dev/null; then
         frpc -c /configs/frpc.* || true
         sleep 5
     done &
+fi
+
+if [ "$distro" = alpine ] && [ -n "$snapshot_id" ] && [ -n "$snapshot_uuid" ]; then
+    rollback_mnt=/mnt
+    set -o pipefail
+    {
+        if rollback_btrfs_from_snapshot "$rollback_mnt"; then
+            umount "$rollback_mnt" 2>/dev/null || true
+            reboot -f
+        else
+            umount "$rollback_mnt" 2>/dev/null || true
+            sync
+            exit 1
+        fi
+    } 2>&1 | tee -a /root/rollback.log
+    exit 0
 fi
 
 # shellcheck disable=SC2154

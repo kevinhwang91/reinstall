@@ -318,6 +318,25 @@ bash reinstall.sh alpine --hold 1
 - `--ssh-port PORT` 修改 SSH 端口
 - `--frpc-config PATH` 添加 frpc 内网穿透，参数填配置文件的本地路径或 HTTP 链接
 
+#### Btrfs 快照恢复
+
+```bash
+bash reinstall.sh rollback --snapshot latest
+bash reinstall.sh rollback --ssh root@backup-host:/.snapshots/123/snapshot
+```
+
+恢复前自动比较当前系统与快照的网络配置；有差异时保留当前 VPS 的配置，包括 MAC 绑定、DHCP/SLAAC、静态地址、路由、DNS 和 MTU。忽略整行注释、空行和行尾空白，不复制 DHCP 租约。恢复后首次启动会按当前 MAC 校正网卡名。
+
+跨磁盘恢复会更新根分区 UUID，并沿用目标系统 `fstab` 中相同挂载点（`/efi` 或 `/boot/efi`）的 EFI 分区设备，避免引用快照来源机器的 EFI 分区。
+
+远端快照直接保存在 `@snapshots/remote-原名-时间戳-进程号`，启动后可从 `/.snapshots/remote-*` 访问。每次先接收到独立临时目录，再创建一级只读快照并删除临时接收子卷和目录，避免覆盖本机同名快照；这些远端条目不加入 Snapper 的编号历史。旧嵌套布局会先保存到原有 `.snapshots` 中，再随恢复整体迁移到顶层。
+
+如果恢复的系统已有 Snapper 的 `root` 配置，会沿用目标磁盘的顶层 `@snapshots`，并更新 `fstab`，将其挂载到 `/.snapshots`。本机快照历史独立于 `@`，回滚或删除旧系统不会删除这些历史。若尚无顶层 `@snapshots`，会将旧布局中的 `@/.snapshots` 连同完整历史迁移到顶层；两者均不存在时才创建空子卷。候选系统的挂载目录非空或子卷准备失败时会停止恢复；迁移或切换失败时会还原旧布局。
+
+支持使用相同网络管理方式的 systemd 系统：networkd、Netplan、NetworkManager（以太网配置）和 ifupdown。跨管理器、多个公网出口或 bridge/bond/VLAN 等复杂拓扑会在准备阶段停止。当前根文件系统须为 Btrfs；候选系统的网络适配完成后才切换 `@`，默认将旧根子卷保留在 `@snapshots/rollback-backup-*`，启动后可通过 `/.snapshots/rollback-backup-*` 访问。这些备份独立于 Snapper 的编号快照。`--rollback-delete-backup` 只在切换完成后删除本次旧根备份，保留其余快照和备份；它并不代表已验证恢复后的 SSH 可达性。
+
+开发验证：`bash tests/rollback.sh`、`bash tests/rollback-network.sh` 和 `bash tests/rollback-ssh.sh`；前两组也可设置 `TEST_BUSYBOX`，用 BusyBox ash 运行。`bash tests/btrfs-layout.sh` 使用临时 loop 设备验证真实 Btrfs 和 Snapper，需要 root 或免密 sudo 及相应工具，结束后自动清理。[存储布局验收记录](tests/btrfs-layout.md)。真实恢复后的网络和外部 SSH 访问需另外验收。
+
 ### 功能 4: 重启到 <img width="16" height="16" src="https://netboot.xyz/img/favicon.ico" /> netboot.xyz
 
 - 可使用商家后台 VNC 手动安装 [更多系统](https://github.com/netbootxyz/netboot.xyz?tab=readme-ov-file#what-operating-systems-are-currently-available-on-netbootxyz)
@@ -805,6 +824,41 @@ bash reinstall.sh ...
 **设计取舍。** 复用已有 URL 下载、initrd 配置打包和 `basic_init` 扩展点，避免增加另一套安装后入口。`network-online.target` 只是系统服务依赖，不保证外部站点一定可达；需要网络重试时由用户脚本明确实现。没有提供 URL 时不应生成此服务；不支持 systemd/Bash 的系统也不能被文档宣称拥有该功能。
 
 **验证依据与边界。** 本轮执行 `bash -n reinstall.sh trans.sh` 并核对重写前后实现一致。历史双虚拟机安装验证过脚本写入标记后删除自身及服务，见既有验收记录；这不证明任意用户脚本的业务逻辑或失败重试可用。本轮没有重新启动虚拟机，也没有执行线上初始化脚本。后续维护须核对 `$$` 的 systemd 转义、退出码保留和目标 Bash 路径，避免修改成安装阶段执行或失败后无条件返回成功。
+
+### 本地与远端快照恢复
+
+对应提交：`feat(rollback): restore snapshots with current VPS networking`。该功能依赖前面的根设备识别，并与 Arch 安装共同约定顶层 `@`、`@swap`、`@snapshots`；后续的快照历史、旧根归档和一级远端路径修复归入同一功能提交。
+
+**需求与入口。** 恢复应替换系统内容，同时保留目标 VPS 当前可用的网络、磁盘 UUID 和本机快照历史。主脚本新增 `rollback --snapshot latest|ID`、`--snapshot-path PATH`、`--ssh USER@HOST:/PATH` 及删除本次旧根的选项；继续复用上游 Alpine initrd 启动流程，不走清盘重装路径。参数互斥和快照有效性在设置恢复入口之前检查。
+
+参数直接交给上游原有的 getopt 流程，远端来源使用正式的 `--ssh USER@HOST:/PATH`。不维护个人修改中的旧 `-ssh` 写法，因此删除额外的参数数组重建和转换循环；无效选项及缺失参数由已有解析器拒绝，无须再增加专门的拒绝分支。缺少 SSH 客户端时，复用 `install_pkg` 按包管理器映射客户端包名，避免为远端恢复另建一套依赖安装器。
+
+**准备阶段。** `resolve_snapper_snapshot_path` 的 latest 只选择 `/.snapshots/数字/snapshot` 中编号最大的项，既不是按日期挑选，也不会把 `remote-*` 或 `rollback-backup-*` 当成 Snapper 历史。`get_btrfs_snapshot_info` 检查真实子卷并提取子卷 ID 和所在文件系统 UUID，`build_extra_cmdline` 将这两个身份写入启动参数；重启后按身份重新解析，避免依赖安装前的临时挂载路径。验证失败必须终止，不能生成一个缺失快照身份的安装入口。
+
+**SSH 接收和一级路径。** `receive_ssh_btrfs_snapshot` 用根设备 helper 挂载目标磁盘顶层，验证已有 `@snapshots`；旧版仅有嵌套子卷时先使用原 `.snapshots`，不在运行系统中提前移动历史；两者都没有才新建存储子卷。远端路径经 shell 引号处理，SSH 命令会将指定来源子卷设置为只读，再用完整的 `btrfs send` 传输；当前没有使用增量发送父快照。
+
+每次流先接收到独立隐藏临时目录，避免覆盖本机同名快照。成功后用 `btrfs subvolume snapshot -r` 在 `@snapshots/remote-原名-时间戳-进程号` 创建一级只读子卷，再删除临时接收子卷和空目录；创建或清理失败均停止准备。额外只读快照利用 Btrfs 共享数据块，不走普通文件复制。它拥有新的本地 UUID；本机实测只读属性和 `received_uuid` 保留，内容正确。不能直接跨父目录移动只读接收子卷：真实测试会返回 `Read-only file system`。这个步骤是一级路径与不覆盖现有数据同时成立所需的改动。
+
+**网络适配为什么独立。** `rollback-network.sh` 同时供宿主 Bash、Alpine BusyBox ash 和首次启动使用；集中同一实现，避免三份网络迁移逻辑漂移。脚本版本标记与入口和 `trans.sh` 一致，以阻止明显不兼容的配套资源。准备阶段保存当前网络后端、唯一以太网上行的 MAC、接口名和配置文件到 initrd，不复制 DHCP 租约。
+
+支持 networkd、Netplan、NetworkManager 的以太网配置和 ifupdown，但要求来源和目标使用同一后端及底层服务。归一化指纹忽略整行注释、空行和行尾空白，保留 YAML 缩进、配置顺序和符号链接目标。配置相同时跳过文件替换；有差异时将候选原配置归档，再复制目标 VPS 的配置，保留地址、路由、DNS、MTU、DHCP/SLAAC 和 MAC 绑定。仅在必要时阻止 cloud-init 再次覆盖网络；只对临时 chroot 缺失的 `/dev` 做局部绑定和卸载。
+
+恢复前检查保存的 MAC 仍能识别，必要时生成 Netplan 配置，并在目标系统启用相应网络服务。首次启动服务在网络服务之前按保存的 MAC 校正接口名，以应对恢复环境与已安装系统命名不同。不同后端、多个上行、bridge/bond/VLAN 等复杂拓扑和不安全的链接目录会提前拒绝；这是当前适配能力的边界，不能通过猜测接口名绕过。
+
+**离线恢复的状态与顺序。** Alpine 入口在正式分区安装之前调用 `rollback_btrfs_from_snapshot`：
+
+1. 按文件系统 UUID 定位设备、挂载顶层，按子卷 ID 找到来源，创建可写候选 `@rollback-restore-*`。来源快照保留，准备过程不修改当前根。
+2. 跨磁盘时替换候选 `fstab` 和已有引导配置中的根 UUID；EFI 不在根快照中，因此从目标当前 `fstab` 沿用相同 `/efi` 或 `/boot/efi` 挂载点的设备，避免引用来源机器的 EFI 分区。
+3. 验证、准备或计划迁移本机快照子卷。候选有 Snapper root 配置时，拒绝符号链接或非空的 `.snapshots` 挂载目录，并将其 `fstab` 快照条目统一为目标 UUID 的 `subvol=/@snapshots`。新布局的本地快照通常已有正确条目；统一重写保留的是处理旧布局、重复条目和陈旧 `subvolid` 的单一路径，当前不会保留该挂载点的自定义选项。
+4. 网络适配完成后才修改当前布局。旧嵌套 `.snapshots` 先整体移到顶层，再将旧 `@` 移到 `@snapshots/rollback-backup-*`，最后将候选改名为 `@`。先移子卷是为了避免把旧 `@` 移入自己的后代。
+5. 旧根移动失败时，把已迁移的快照子卷放回原根；候选激活失败时，先将旧根移回 `@`，再将快照子卷放回嵌套位置。还原顺序不能倒置，否则会再次遇到父子关系冲突。网络准备失败时还没有移动旧根。
+6. 默认保留旧根。`--rollback-delete-backup` 只在切换后删除本次旧根备份，不删除其他历史或远端快照，也不代表已验证恢复后的 SSH 可达性。成功后显式卸载顶层并重启；失败时记录日志、卸载并退出，不自动进入候选系统。
+
+**持久数据与失败边界。** `@snapshots` 在根快照之外，回滚到早期系统仍保留后来创建的本机历史；`rollback-backup-*` 是直接移动的旧可写根子卷，`remote-*` 是只读来源，两者均没有注册成 Snapper 编号快照。旧版本留下的顶层备份、二级远端目录及更早备份中的嵌套历史不会被自动重排。候选创建后失败可能保留候选或接收产物用于检查；没有恢复已明确删除的全局自动清理方案。根快照中没有的较新文件也不会被网络适配补回，包括之后新增的出站 SSH 授权材料，应由用户在恢复后自行处理。
+
+**验证论据。** `bash tests/rollback.sh` 有 30 个恢复场景，`bash tests/rollback-network.sh` 有 8 组，两者也使用 `TEST_BUSYBOX=/usr/lib/initcpio/busybox` 运行；覆盖失败前保留旧根、迁移与激活的撤销、EFI/根 UUID、已有历史、挂载条目以及四种网络后端。`bash tests/rollback-ssh.sh` 有 12 个接收场景，覆盖路径、重名、缺失结果、传输失败、只读快照创建和清理失败；另抽取实际 getopt 代码验证 `--ssh` 的参数顺序和带空格路径，以及拒绝 `-ssh` 和缺失来源参数。
+
+`bash tests/btrfs-layout.sh` 使用真实 Btrfs、Snapper、send/receive 和 `fstab` 挂载，验证 4 组新布局接收、保留历史、本地删除策略和旧布局失败/成功迁移；SSH 传输由本地执行替代，不能当作真实 SSH 验收。详细证据见现有 [存储验收](tests/btrfs-layout.md)。[历史双虚拟机记录](tests/vm-acceptance.md) 覆盖旧布局的真实启动和 SSH；当前一级路径尚未重新进行虚拟机启动、真实 SSH、BIOS、ARM 或公网 VPS 验收。维护时应先确认失败发生在接收、候选准备还是切换阶段，再针对相应回归扩展测试，不能只凭成功日志判断系统可达。
 
 ## 感谢
 

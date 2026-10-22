@@ -156,6 +156,7 @@ certutil -urlcache -f -split https://cnb.cool/bin456789/reinstall/-/git/raw/main
 - 安装 Red Hat 时需填写 <https://access.redhat.com/downloads/content/rhel> 得到的 `qcow2` 镜像链接，也可以安装其它类 RHEL 系统的 `qcow2`，例如 `Alibaba Cloud Linux` 和 `TencentOS Server`
 - 重装后如需修改 SSH 端口或者改成密钥登录，注意还要修改 `/etc/ssh/sshd_config.d/` 里面的文件
 - 为了快速安装，重装时不会对新系统进行更新，请在重装后自行更新
+- Arch 默认使用 Btrfs（顶层子卷 `@` 挂载到 `/`、`@swap` 挂载到 `/swap`、`@snapshots` 挂载到 `/.snapshots`）、Snapper 和 LTS 内核，语言为 `en_US.UTF-8`，GRUB 等待 1 秒。
 - 安装飞牛 fnOS/FygoOS 时设置的用户名、密码、密钥仅用于安装期间登录 SSH 查看日志，不会应用到新系统。系统安装后需到后台面板 <http://IP:5666> 创建用户和开启 SSH
 
 ```bash
@@ -761,6 +762,32 @@ bash reinstall.sh ...
 **为何保留少量重复。** 旧版扩容脚本是独立入口，直接导入主脚本会触发其入口。保留两份小函数比新增运行时下载依赖更小；改算法时必须核对两份实现。SSH 快照接收复用 `get_mount_block_dev /`，此函数不能混入挂载、格式化或分区操作。
 
 **边界与验证。** 回退要求挂载设备号能由 `lsblk` 对应到块设备，没有新增 overlay、网络根或任意复杂堆叠存储支持。本轮执行 `bash -n reinstall.sh deprecated/resize.sh` 并逐项比较重写前后的函数。现有接收测试使用设备路径替身，不能证明 `/dev/root` 的真实反查；当前没有针对该特殊挂载形式的新虚拟机验收。后续改动应验证有效路径、设备号回退、无结果和多个父磁盘四种情况。
+
+### Arch 安装、子卷布局和默认值
+
+对应提交：`feat(arch): install with btrfs and snapper`。
+
+**相对上游的意图。** 上游通用分区使用 ext4，Arch 默认安装普通内核。这里为 Arch 建立可恢复的根子卷和独立快照历史，并保留用户指定的语言和 GRUB 等待时间；共享安装函数中的其他发行版保持原有默认值。
+
+**分区与挂载逻辑。** `trans.sh` 的 `create_part` 保留 EFI、BIOS 大磁盘和普通 BIOS 三条分区路径，仅在 Arch 选择 Btrfs、安装工具并加载模块。三个格式化调用使用 `mkfs_linux_os_part`：Arch 格式化 Btrfs、短暂挂载顶层并创建 `@` 和 `@swap`；其他系统仍执行原来的 ext4 命令与选项。`mount_part_basic_layout` 将 Arch 的 `@` 挂载为目标根，选项为 `noatime,compress=zstd`，其他系统继续使用 ext4。
+
+| 顶层子卷 | 挂载点 | 保留理由 |
+| --- | --- | --- |
+| `@` | `/` | 根快照恢复只替换这一子卷 |
+| `@swap` | `/swap` | 交换文件位置独立于根快照 |
+| `@snapshots` | `/.snapshots` | 快照历史不随旧根移动或删除 |
+
+脚本提供 `/swap` 子卷和注释形式的交换文件条目，没有自动创建并启用 `/swap/swapfile`。
+
+**安装顺序及必要性。** Arch 包选择为 `linux-lts btrfs-progs snapper`。安装包前创建普通目录 `/var/lib/portables` 和 `/var/lib/machines`，防止 systemd tmpfiles 的 `Q` 规则将它们建立为根快照不递归包含的额外子卷；依据包括 `portables.conf`、`systemd-nspawn.conf` 的规则和历史安装子卷检查。
+
+在生成 `fstab` 前挂载 `@swap` 并调用 `setup_arch_snapper`。没有配置时，用 `snapper --no-dbus -c root create-config /` 创建 root 配置和初始 `.snapshots`，关闭 timeline timer。随后挂载 Btrfs 顶层，在同一挂载点内将 `@/.snapshots` 移为 `@snapshots`，再挂载到目标根的 `/.snapshots`。真实测试检出跨挂载点 `mv` 会变为普通目录复制，因此必须使用同一个顶层挂载点中的源和目标路径。
+
+沿用上游 `genfstab`。原来的 `sed '/swap/d'` 会误删 `/swap` 和 `@swap` 的有效条目，因此改为只排除第三列类型为 `swap` 的条目。拆除生成器环境后显式卸载快照和交换子卷；没有引入全局失败清理 trap。
+
+`set_locale` 只在 Arch 启用 `en_US.UTF-8` 并写入 `locale.conf`，Gentoo/AOSC 保留 `C.UTF-8` 原流程。生成 GRUB 配置前只在 Arch 设置 `GRUB_TIMEOUT=1`。这些条件是明确作用域，不能因为安装函数共享而提升为所有发行版的默认值。
+
+**验证与维护依据。** `bash -n trans.sh` 检查语法；最终的 `bash tests/btrfs-layout.sh` 实际调用格式化和 Snapper 初始化函数，验证真实 Btrfs、`genfstab` 和快照创建。存储测试随后半段恢复功能一起提交，因为它依赖恢复函数。历史双虚拟机测试覆盖 x86_64 UEFI、LTS、语言和 GRUB 默认值，当时采用嵌套布局；新的顶层布局尚未重新完成整套虚拟机安装和启动，也没有新增 BIOS、ARM 实机覆盖。同步上游优先核对三个格式化调用点、Snapper 与 `genfstab` 的顺序和发行版条件。
 
 ## 感谢
 

@@ -156,6 +156,7 @@ certutil -urlcache -f -split https://cnb.cool/bin456789/reinstall/-/git/raw/main
 - When installing Red Hat, you must provide the `qcow2` image link obtained from <https://access.redhat.com/downloads/content/rhel>. You can also install `qcow2` of other RHEL-based OS, such as `Alibaba Cloud Linux` and `TencentOS Server`.
 - After reinstallation, if you need to change the SSH port or switch to key-based login, make sure to also modify the files inside `/etc/ssh/sshd_config.d/`.
 - To ensure a faster reinstall, the new system will not be updated during the process. Please update the system manually after reinstallation.
+- Arch uses Btrfs with top-level subvolumes `@` mounted at `/`, `@swap` at `/swap`, and `@snapshots` at `/.snapshots`, plus Snapper and the LTS kernel, with `en_US.UTF-8` and a one-second GRUB timeout.
 - The username, password, and key configured during the installation of fnOS/FygoOS are only used to log in via SSH to view logs during installation, and will not be applied to the new system. After installation, you need to go to the admin panel at <http://IP:5666> to create a user and enable SSH.
 
 ```bash

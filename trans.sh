@@ -2330,6 +2330,24 @@ basic_init() {
     add_frpc_systemd_service_if_need $os_dir
 }
 
+setup_arch_snapper() {
+    local root=$1 dev=$2 top=${3:-/mnt}
+
+    if [ ! -f "$root/etc/snapper/configs/root" ]; then
+        chroot "$root" snapper --no-dbus -c root create-config / || return 1
+        chroot "$root" systemctl disable snapper-timeline.timer || return 1
+    fi
+    mkdir -p "$top" || return 1
+    mount -t btrfs -o subvolid=5 "$dev" "$top" || return 1
+    if [ ! -e "$top/@snapshots" ]; then
+        mv "$top/@/.snapshots" "$top/@snapshots" || return 1
+    fi
+    btrfs subvolume show "$top/@snapshots" >/dev/null 2>&1 || return 1
+    mkdir -p "$root/.snapshots" || return 1
+    mount -t btrfs -o noatime,subvol=@snapshots "$dev" "$root/.snapshots" || return 1
+    umount "$top"
+}
+
 install_arch_gentoo_aosc() {
     info "install $distro"
 
@@ -2341,7 +2359,12 @@ install_arch_gentoo_aosc() {
     )
 
     set_locale() {
-        echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        if [ "$distro" = arch ]; then
+            sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' $os_dir/etc/locale.gen
+            echo 'LANG=en_US.UTF-8' >$os_dir/etc/locale.conf
+        else
+            echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        fi
         chroot $os_dir locale-gen
     }
 
@@ -2378,6 +2401,7 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 EOF
         mkdir -p $alpine_rootfs/etc/pacman.d
+        mkdir -p "$os_dir/var/lib/portables" "$os_dir/var/lib/machines"
         # shellcheck disable=SC2016
         case "$(uname -m)" in
         x86_64) dir='$repo/os/$arch' ;;
@@ -2442,7 +2466,7 @@ EOF
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
-        chroot $os_dir pacman -Syu --noconfirm linux
+        chroot $os_dir pacman -Syu --noconfirm linux-lts btrfs-progs snapper
     }
 
     # shellcheck disable=SC2317
@@ -2710,7 +2734,19 @@ EOF
     fi
     ttys_cmdline=$(get_ttys console=)
     echo GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $ttys_cmdline\" >>$file
+
+    if [ "$distro" = arch ]; then
+        sed -i '/^GRUB_TIMEOUT=/d' "$file"
+        echo 'GRUB_TIMEOUT=1' >>"$file"
+    fi
     chroot $os_dir grub-mkconfig -o /boot/grub/grub.cfg
+
+    if [ "$distro" = arch ]; then
+        mkdir -p "$os_dir/swap"
+        mount -t btrfs -o noatime,subvol=@swap "/dev/$(xda $os_part_num)" "$os_dir/swap"
+        # 在生成 fstab 前挂载顶层 @snapshots。
+        setup_arch_snapper "$os_dir" "/dev/$(xda $os_part_num)"
+    fi
 
     # fstab
     # fstab 可不写 efi 条目， systemd automount 会自动挂载
@@ -2719,9 +2755,16 @@ EOF
     create_alpine_rootfs_with_arch_install_scripts "$alpine_rootfs" true "$os_dir"
     # genfstab 会用到 findmnt 等工具
     retry 5 chroot "$alpine_rootfs" apk add util-linux
-    chroot "$alpine_rootfs" genfstab -U /parent | sed '/swap/d' >>$os_dir/etc/fstab
+    chroot "$alpine_rootfs" genfstab -U /parent | awk '$3 != "swap"' >>"$os_dir/etc/fstab"
+    if [ "$distro" = arch ]; then
+        echo '# /swap/swapfile none swap defaults,nofail,pri=10 0 0' >>"$os_dir/etc/fstab"
+    fi
     umount -R "$alpine_rootfs/parent"
     remove_alpine_rootfs "$alpine_rootfs"
+    if [ "$distro" = arch ]; then
+        umount "$os_dir/.snapshots"
+        umount "$os_dir/swap"
+    fi
 
     # 删除 resolv.conf，不然 systemd-resolved 无法创建软链接
     rm_resolv_conf $os_dir
@@ -2919,12 +2962,31 @@ xda() {
     fi
 }
 
+mkfs_linux_os_part() {
+    local part_dev=$1
+
+    if [ "$distro" = arch ]; then
+        mkfs.btrfs -f -L os "$part_dev"
+        mkdir -p /mnt
+        mount "$part_dev" /mnt
+        btrfs subvolume create /mnt/@
+        btrfs subvolume create /mnt/@swap
+        umount /mnt
+    else
+        mkfs.ext4 -F $ext4_opts "$part_dev"
+    fi
+}
+
 create_part() {
     # 除了 dd 都会用到
     info "Create Part"
 
     # 分区工具
     apk add parted e2fsprogs
+    if [ "$distro" = arch ]; then
+        apk add btrfs-progs
+        modprobe btrfs
+    fi
     if is_efi; then
         apk add dosfstools
     fi
@@ -3122,37 +3184,39 @@ create_part() {
         # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
         # 而且 alpine 的 extlinux 不兼容 64bit ext4
         [ "$distro" = alpine ] && ext4_opts="-O ^64bit" || ext4_opts=
+        os_part_type=ext4
+        [ "$distro" = arch ] && os_part_type=btrfs
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 101MiB \
-                mkpart '" "' ext4 101MiB 100% \
+                mkpart '" "' $os_part_type 101MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.fat "/dev/$(xda 1)"                #1 efi
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            mkfs.fat "/dev/$(xda 1)"           #1 efi
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB 2MiB \
-                mkpart '" "' ext4 2MiB 100% \
+                mkpart '" "' $os_part_type 2MiB 100% \
                 set 1 bios_grub on
             update_part
 
-            echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            echo                               #1 bios_boot
+            mkfs_linux_os_part "/dev/$(xda 2)" #2 os
         else
             # bios
             parted /dev/$xda -s -- \
                 mklabel msdos \
-                mkpart primary ext4 1MiB 100% \
+                mkpart primary $os_part_type 1MiB 100% \
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
+            mkfs_linux_os_part "/dev/$(xda 1)" #1 os
         fi
     else
         # 安装红帽系或ubuntu
@@ -6216,10 +6280,14 @@ mount_part_basic_layout() {
     else
         os_part_num=1
     fi
-
+    part_dev="/dev/$(xda $os_part_num)"
     # 挂载系统分区
     mkdir -p $os_dir
-    mount -t ext4 "/dev/$(xda $os_part_num)" $os_dir
+    if [ "$distro" = arch ]; then
+        mount -t btrfs -o noatime,compress=zstd,subvol=@ "$part_dev" "$os_dir"
+    else
+        mount -t ext4 "$part_dev" "$os_dir"
+    fi
 
     # 挂载 efi 分区
     if is_efi; then

@@ -191,6 +191,7 @@ bash reinstall.sh anolis      7|8|23
 - `--web-port PORT` 修改 Web 端口（安装期间观察日志用）
 - `--frpc-config PATH` 添加 frpc 内网穿透，参数填配置文件的本地路径或 HTTP 链接
 - `--no-cloud-kernel` 不使用云内核，避免部分机器黑屏/花屏，适用于 Debian、Ubuntu、Alpine、openSUSE
+- `--user-init-url URL` 添加用户自定义 VPS 初始化脚本，支持 systemd Linux，首次启动执行，输出查看 `journalctl -u reinstall-user-init.service`，执行后自动清理脚本和服务
 - `--hold 1` 仅重启到安装环境，不运行安装，用于 SSH 登录验证网络连通性
 - `--hold 2` 安装结束后不重启，用于 SSH 登录修改系统内容，Debian/Kali 会挂载在 `/target`，其它系统会挂载在 `/os`
 
@@ -788,6 +789,22 @@ bash reinstall.sh ...
 `set_locale` 只在 Arch 启用 `en_US.UTF-8` 并写入 `locale.conf`，Gentoo/AOSC 保留 `C.UTF-8` 原流程。生成 GRUB 配置前只在 Arch 设置 `GRUB_TIMEOUT=1`。这些条件是明确作用域，不能因为安装函数共享而提升为所有发行版的默认值。
 
 **验证与维护依据。** `bash -n trans.sh` 检查语法；最终的 `bash tests/btrfs-layout.sh` 实际调用格式化和 Snapper 初始化函数，验证真实 Btrfs、`genfstab` 和快照创建。存储测试随后半段恢复功能一起提交，因为它依赖恢复函数。历史双虚拟机测试覆盖 x86_64 UEFI、LTS、语言和 GRUB 默认值，当时采用嵌套布局；新的顶层布局尚未重新完成整套虚拟机安装和启动，也没有新增 BIOS、ARM 实机覆盖。同步上游优先核对三个格式化调用点、Snapper 与 `genfstab` 的顺序和发行版条件。
+
+### 可选的首次启动初始化
+
+对应提交：`feat(linux): run optional user initialization on first boot`。
+
+**问题与意图。** 新安装的 VPS 可能需要用户自定义初始化，但安装环境与目标系统的内核、网络和服务尚不相同。此功能让用户明确提供的 Bash 脚本在目标系统第一次正常启动时运行，不在安装阶段执行这些自定义操作。
+
+**执行链路。** `reinstall.sh` 的 `--user-init-url` 仅接受 HTTP/HTTPS，准备阶段用 `curl -fL` 下载并设置 `600` 权限；生成 initrd 时将文件复制到 `/configs/user-init.sh`。这样首次启动使用的是已下载内容，不会在启动时重新获取 URL 的最新内容。
+
+`trans.sh` 的 `basic_init` 调用 `add_user_init_systemd_service_if_need`：没有提供脚本、目标没有 systemctl 或 Bash 时直接返回，避免增加其他安装的副作用。有条件时选择目标的 `/usr/bin/bash` 或 `/bin/bash`，复制脚本到 `/usr/local/lib/reinstall-user-init.sh`、设置 `700` 权限，并在目标 chroot 中启用 oneshot 服务。
+
+服务排列在 `network-online.target` 之后，以系统服务默认身份执行脚本。`ExecStart` 保存脚本退出码，随后禁用并删除服务和脚本、重新加载 systemd，最后返回原退出码。无论脚本成功还是失败均清理，因此这是一次执行，不是失败后自动重试；清理失败不会故意掩盖脚本本来的退出码。
+
+**设计取舍。** 复用已有 URL 下载、initrd 配置打包和 `basic_init` 扩展点，避免增加另一套安装后入口。`network-online.target` 只是系统服务依赖，不保证外部站点一定可达；需要网络重试时由用户脚本明确实现。没有提供 URL 时不应生成此服务；不支持 systemd/Bash 的系统也不能被文档宣称拥有该功能。
+
+**验证依据与边界。** 本轮执行 `bash -n reinstall.sh trans.sh` 并核对重写前后实现一致。历史双虚拟机安装验证过脚本写入标记后删除自身及服务，见既有验收记录；这不证明任意用户脚本的业务逻辑或失败重试可用。本轮没有重新启动虚拟机，也没有执行线上初始化脚本。后续维护须核对 `$$` 的 systemd 转义、退出码保留和目标 Bash 路径，避免修改成安装阶段执行或失败后无条件返回成功。
 
 ## 感谢
 
